@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+adaptive_output/
+.workbuddy-ai/
