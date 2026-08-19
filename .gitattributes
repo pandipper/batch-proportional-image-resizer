@@ -1,0 +1,13 @@
+# Normalize line endings to LF on checkout and in the repo.
+# Python projects should use LF (PEP 8); avoids CRLF/LF churn across platforms.
+* text=auto eol=lf
+
+# Binary assets (never touch line endings)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.bmp binary
+*.tif binary
+*.tiff binary
+*.gif binary
