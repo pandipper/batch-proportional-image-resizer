@@ -136,16 +136,17 @@ def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width
     return ok, skip
 
 
-def pick_tier_by_height(h, tiers):
-    """套装开时按图高就近选档（绝对差最小）。"""
-    best = None
-    best_diff = None
-    for k, v in tiers.items():
-        d = abs(h - v["h"])
-        if best_diff is None or d < best_diff:
-            best_diff = d
-            best = k
-    return best
+def pick_tier_auto(iw, ih, tiers):
+    """套装开自动选档：在「源图能完整覆盖该档（不放大）」的前提下取最大档；
+    若源图比所有档都小，则取最小档（避免把小图放大到超大尺寸）。
+    例：1280×1280 这类小图落到 小档(1280×720) 而非被放大到 大档(2560×1440)。
+    """
+    ordered = sorted(tiers.items(), key=lambda kv: kv[1]["h"], reverse=True)
+    for k, t in ordered:
+        if iw >= t["w"] and ih >= t["h"]:
+            return k
+    # 源图比所有档都小：取最小档
+    return min(tiers.items(), key=lambda kv: kv[1]["h"])[0]
 
 
 def cover_scale(iw, ih, bw, bh):
@@ -248,8 +249,12 @@ def main():
             self._build_ui()
             self._refresh_queue()
             self._focus_rescan()  # 首次加载
-            self.root.bind("<FocusIn>", lambda e: self._focus_rescan())
-            # 快捷键：焦点在输入框/按钮上时不触发，避免与输入冲突
+            self.root.bind("<FocusIn>", self._on_focus_in)
+            # 点击任意控件后把焦点交还画布：确保空格等快捷键可靠触发，
+            # 避免焦点停在按钮上导致空格被当成「再次点击该按钮」（表现为只刷新不裁剪）
+            self.root.bind("<ButtonRelease-1>", self._refocus)
+            # 快捷键：焦点在输入框（Entry）时不触发，避免与数字/文字输入冲突；
+            # 按钮焦点已通过 _refocus 交还画布，故此处无需排除按钮
             self.root.bind("<space>", self._kbd(self.confirm_crop))
             self.root.bind("<c>", self._kbd(self.center_box))
             self.root.bind("1", self._kbd(self.rework_prev))
@@ -259,10 +264,27 @@ def main():
         def _kbd(self, action):
             def handler(event):
                 fw = self.root.focus_get()
-                if isinstance(fw, (tk.Entry, ttk.Entry, tk.Button, ttk.Button)):
+                if isinstance(fw, (tk.Entry, ttk.Entry, ttk.Spinbox, tk.Button, ttk.Button)):
                     return  # 正在输入或按钮聚焦 → 不触发全局快捷键
                 action()
             return handler
+
+        # ---------------- 焦点管理 ----------------
+        def _on_focus_in(self, event):
+            # 仅在窗口本身获得焦点时（如从其他程序切回）才重扫，
+            # 避免内部焦点切换（点按钮/列表）误触发重绘假象
+            if event.widget is self.root:
+                self._focus_rescan()
+
+        def _refocus(self, event=None):
+            # 点击按钮后把焦点交还画布，保证后续空格/1/3 快捷键可靠触发裁剪
+            w = getattr(event, "widget", None) if event is not None else None
+            if isinstance(w, (tk.Entry, ttk.Entry, ttk.Spinbox, tk.Listbox)):
+                return  # 正在文字输入或选择列表时不抢焦点
+            try:
+                self.canvas.focus_set()
+            except Exception:
+                pass
 
         # ---------------- UI（三栏）----------------
         def _build_ui(self):
@@ -640,7 +662,7 @@ def main():
                 if self.manual_tier:
                     t = self.cfg["tiers"][self.manual_tier]
                 else:
-                    t = self.cfg["tiers"][pick_tier_by_height(self.img.size[1], self.cfg["tiers"])]
+                    t = self.cfg["tiers"][pick_tier_auto(*self.img.size, self.cfg["tiers"])]
                 return t["w"], t["h"]
             else:
                 try:
