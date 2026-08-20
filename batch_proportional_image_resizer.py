@@ -94,44 +94,22 @@ def list_source_images(folder):
         return []
 
 
-def step1_target_size(iw, ih, min_width=1280):
-    """依源图尺寸计算 step1 归一化目标尺寸（返回 (w, h)，永不保持原图）。
+def step1_target_size(iw, ih, target_height=720):
+    """依源图尺寸计算 step1 归一化目标尺寸（返回 (w, h)）。
 
-    规则：
-      按源宽分档：>2560→2560；1920–2560→1920；1280–1920→1280
-      最小档兜底：源宽 < 最小档宽时，**放大到最小档宽**（取消「不放大保护」）
-      高度兜底：计算高 <720 时强制高=720、宽按比例重算（优先于宽封顶，允许宽>2560）
-      最小档宽由 min_width 控制（GUI 传入 small 档宽，默认 1280）。
+    规则（用户要求「规范为 720 高」）：
+      将图高等比缩放到 target_height（默认取 small 档高 720），宽度按比例。
+      小于该高的图会被放大到该高，大于的图会缩小到该高。
+      这样规范素材图所有图高度一致为 target_height，step2 再用 COVER 缩放裁出各档。
     """
-    if iw > 2560:
-        w = 2560
-    elif iw >= 1920:
-        w = 1920
-    elif iw >= 1280:
-        w = 1280
-    else:
-        w = 1280  # 小于最小档宽 → 放大到最小档宽
-
-    # 最小档兜底：保证不低于最小档宽（如用户把 small 档调高，则一并抬升下限）
-    if w < min_width:
-        w = min_width
-
-    # 等比缩放
-    if iw > 0:
-        h = round(ih * (w / iw))
-    else:
-        h = ih
-
-    # 高度兜底
-    if h < 720:
-        h = 720
-        if ih > 0:
-            w = round(iw * (h / ih))
-
-    return (w, h)
+    if ih <= 0:
+        return (max(1, iw), int(target_height))
+    h = int(target_height)
+    w = round(iw * (h / ih))
+    return (max(1, w), h)
 
 
-def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width=1280):
+def process_step1(source_paths, out_dir, quality=90, on_progress=None, target_height=720):
     """对一组源图执行 step1，结果写入 out_dir（同名覆盖）。返回 (成功数, 跳过数)。"""
     ok = 0
     skip = 0
@@ -145,7 +123,7 @@ def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width
         try:
             with Image.open(src) as im:
                 im = im.convert("RGB")
-                tgt = step1_target_size(*im.size, min_width=min_width)
+                tgt = step1_target_size(*im.size, target_height=target_height)
                 out = im.resize(tgt, _RESAMPLE)
                 base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
                 out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
@@ -239,6 +217,8 @@ def main():
             self.config_path = os.path.join(self.work_dir, "config.json")
             self.cfg = load_config(self.config_path)
             self.dirs = ensure_dirs(self.work_dir)
+            # 启动模式：若规范素材图已有图，直接进入裁剪态；否则进入导入态
+            self.mode = "crop" if list_source_images(self.dirs["spec"]) else "import"
 
             self.source_paths = []          # 任意位置源图
             self.queue = []                 # 规范素材图 顶层图片文件名
@@ -298,14 +278,24 @@ def main():
             left = ttk.Frame(mid, width=240)
             left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
             left.pack_propagate(False)
-            ttk.Label(left, text="素材队列", anchor="w").pack(fill=tk.X, pady=(2, 2))
+            self.queue_title = ttk.Label(left, text="素材队列", anchor="w")
+            self.queue_title.pack(fill=tk.X, pady=(2, 2))
             self.queue_list = tk.Listbox(left, exportselection=False)
             self.queue_list.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
             self.queue_list.bind("<<ListboxSelect>>", self._on_queue_select)
+            # 顺序调整
+            obtn = ttk.Frame(left)
+            obtn.pack(fill=tk.X, pady=1)
+            ttk.Button(obtn, text="↑ 上移", command=self.move_up).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+            ttk.Button(obtn, text="↓ 下移", command=self.move_down).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
             lbtn = ttk.Frame(left)
             lbtn.pack(fill=tk.X, pady=2)
             ttk.Button(lbtn, text="导入文件夹", command=self.import_folder).pack(fill=tk.X, pady=1)
             ttk.Button(lbtn, text="导入文件", command=self.import_files).pack(fill=tk.X, pady=1)
+            ttk.Label(left, text="（可从资源管理器拖拽图片到本窗口导入）", anchor="w",
+                      wraplength=230, font=("TkDefaultFont", 8)).pack(fill=tk.X, pady=(4, 0))
+            # 注册系统拖放（Windows）；非 Windows 静默忽略
+            self._enable_drop_target()
 
             # ---- 中栏：画布 ----
             center = ttk.Frame(mid)
@@ -390,13 +380,98 @@ def main():
             d = filedialog.askdirectory(title="选择源图片文件夹")
             if d:
                 self.source_paths = [os.path.join(d, n) for n in list_source_images(d)]
+                self.mode = "import"
+                self._clear_canvas()
+                self.img = None
+                self.img_name = None
+                self._fill_listbox()
                 self.progress_var.set(f"已导入文件夹：{len(self.source_paths)} 张（源图保留在原位置）")
 
         def import_files(self):
             fs = filedialog.askopenfilenames(title="选择图片文件", filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
             if fs:
                 self.source_paths = list(fs)  # 替换当前源
+                self.mode = "import"
+                self._clear_canvas()
+                self.img = None
+                self.img_name = None
+                self._fill_listbox()
                 self.progress_var.set(f"已导入文件：{len(self.source_paths)} 张")
+
+        # ---------------- 系统拖放（Windows WM_DROPFILES）----------------
+        def _enable_drop_target(self):
+            try:
+                import ctypes
+                from ctypes import wintypes
+                WM_DROPFILES = 0x0233
+                GWL_WNDPROC = -4
+                shell32 = ctypes.windll.shell32
+                user32 = ctypes.windll.user32
+                hwnd = self.root.winfo_id()
+                proto = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, ctypes.c_int, ctypes.c_uint, ctypes.c_int, ctypes.c_int)
+
+                def hook(hWnd, Msg, wParam, lParam):
+                    if Msg == WM_DROPFILES:
+                        hDrop = ctypes.c_int(wParam)
+                        count = shell32.DragQueryFileW(hDrop, 0xFFFFFFFF, 0, 0)
+                        files = []
+                        for i in range(count):
+                            buf = ctypes.create_unicode_buffer(1024)
+                            shell32.DragQueryFileW(hDrop, i, buf, 1024)
+                            files.append(buf.value)
+                        shell32.DragFinish(hDrop)
+                        self.root.after(0, lambda: self._on_drop(files))
+                        return 0
+                    return user32.CallWindowProcW(self._orig_wndproc, hWnd, Msg, wParam, lParam)
+
+                self._drop_hook = proto(hook)
+                self._orig_wndproc = user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, self._drop_hook)
+                shell32.DragAcceptFiles(hwnd, True)
+            except Exception:
+                pass  # 非 Windows 或不支持则静默忽略，仍可用导入按钮
+
+        def _on_drop(self, files):
+            imgs = [f for f in files if is_image(f)]
+            if not imgs:
+                return
+            self.source_paths = list(self.source_paths) + imgs  # 追加导入
+            self.mode = "import"
+            self._clear_canvas()
+            self.img = None
+            self.img_name = None
+            self._fill_listbox()
+            self.progress_var.set(
+                f"已拖入 {len(imgs)} 张，导入队列共 {len(self.source_paths)} 张；点击「规范素材尺寸」生成规范素材图。")
+
+        # ---------------- 顺序调整 ----------------
+        def move_up(self):
+            self._reorder(-1)
+
+        def move_down(self):
+            self._reorder(1)
+
+        def _reorder(self, delta):
+            lst = self.source_paths if self.mode == "import" else self.queue
+            if not lst:
+                return
+            sel = self.queue_list.curselection()
+            if not sel:
+                return
+            i = sel[0]
+            j = i + delta
+            if j < 0 or j >= len(lst):
+                return
+            lst[i], lst[j] = lst[j], lst[i]
+            self.idx = j
+            self._fill_listbox()
+            try:
+                self.queue_list.selection_set(j)
+                self.queue_list.see(j)
+            except Exception:
+                pass
+            if self.mode == "crop":
+                self._load_current()  # 同步画布到新选中的图
 
         # ---------------- step1 ----------------
         def run_step1(self):
@@ -414,7 +489,7 @@ def main():
                     ok, skip = process_step1(
                         self.source_paths, self.dirs["spec"],
                         quality=self.quality.get(), on_progress=cb,
-                        min_width=self.cfg["tiers"]["small"]["w"])
+                        target_height=self.cfg["tiers"]["small"]["h"])
                     self.root.after(0, lambda: self.progress_var.set(f"规范素材尺寸完成：成功 {ok}，跳过 {skip}"))
                 except Exception as e:
                     self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
@@ -425,6 +500,7 @@ def main():
 
         def _after_step1(self):
             self.root.config(cursor="")
+            self.mode = "crop"
             self._refresh_queue()
             self.idx = 0
             self._load_current()
@@ -441,20 +517,32 @@ def main():
             if not hasattr(self, "queue_list"):
                 return
             self.queue_list.delete(0, tk.END)
-            for f in self.queue:
-                self.queue_list.insert(tk.END, f)
+            if self.mode == "import":
+                self.queue_title.configure(text=f"素材导入队列（{len(self.source_paths)}）")
+                for f in self.source_paths:
+                    self.queue_list.insert(tk.END, os.path.basename(f))
+            else:
+                self.queue_title.configure(text=f"素材队列（{len(self.queue)}）")
+                for f in self.queue:
+                    self.queue_list.insert(tk.END, f)
 
         def _on_queue_select(self, event):
             sel = self.queue_list.curselection()
             if not sel:
                 return
             i = sel[0]
+            if self.mode == "import":
+                self.idx = i  # 导入态：仅记录选择，未归一化不加载
+                return
             if i == self.idx:
                 return
             self.idx = i
             self._load_current()
 
         def _focus_rescan(self):
+            if self.mode == "import":
+                self._fill_listbox()
+                return
             prev_name = self.img_name
             self._refresh_queue()
             if not self.queue:
@@ -472,6 +560,10 @@ def main():
 
         # ---------------- 加载/绘制 ----------------
         def _load_current(self):
+            if self.mode == "import":
+                self._clear_canvas()
+                self.info_var.set("导入模式：点击「规范素材尺寸」生成规范素材图后再裁剪。")
+                return
             if not self.queue:
                 self._clear_canvas()
                 return
