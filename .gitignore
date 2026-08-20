@@ -3,3 +3,11 @@ __pycache__/
 adaptive_output/
 .workbuddy-ai/
 .workbuddy/
+
+# 运行时自动生成的图片工作目录（不进仓库）
+规范素材图/
+修改后成图/
+素材图/
+测试素材/
+config.json
+
