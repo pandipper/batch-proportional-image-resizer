@@ -8,8 +8,8 @@
 # 工作目录固定在 exe 同目录，自动创建两个文件夹：
 #   规范素材图/    —— step1 输出 & step2 唯一输入源
 #   修改后成图/    —— step2 导出目标
-#   规范素材图/返工/      —— q 键搬运「上一张」的来源
-#   修改后成图/精修/      —— E 键搬运「上一张」的结果
+#   规范素材图/返工/      —— 1 键搬运「上一张」的来源
+#   修改后成图/精修/      —— 3 键搬运「上一张」的结果
 
 import os
 import sys
@@ -233,7 +233,7 @@ def main():
         def __init__(self, root):
             self.root = root
             self.root.title(APP_TITLE)
-            self.root.geometry("1180x760")
+            self.root.geometry("1200x780")
 
             self.work_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
             self.config_path = os.path.join(self.work_dir, "config.json")
@@ -266,45 +266,67 @@ def main():
             self._refresh_queue()
             self._focus_rescan()  # 首次加载
             self.root.bind("<FocusIn>", lambda e: self._focus_rescan())
-            self.root.bind("<space>", lambda e: self.confirm_crop())
-            self.root.bind("<c>", lambda e: self.center_box())
-            self.root.bind("<q>", lambda e: self.rework_prev())
-            self.root.bind("<e>", lambda e: self.retouch_prev())
+            # 快捷键：焦点在输入框/按钮上时不触发，避免与输入冲突
+            self.root.bind("<space>", self._kbd(self.confirm_crop))
+            self.root.bind("<c>", self._kbd(self.center_box))
+            self.root.bind("1", self._kbd(self.rework_prev))
+            self.root.bind("3", self._kbd(self.retouch_prev))
 
-        # ---------------- UI ----------------
+        # ---------------- 快捷键焦点感知 ----------------
+        def _kbd(self, action):
+            def handler(event):
+                fw = self.root.focus_get()
+                if isinstance(fw, (tk.Entry, ttk.Entry, tk.Button, ttk.Button)):
+                    return  # 正在输入或按钮聚焦 → 不触发全局快捷键
+                action()
+            return handler
+
+        # ---------------- UI（三栏）----------------
         def _build_ui(self):
-            # 顶部工具栏
+            # 顶部工具栏：全局动作
             top = ttk.Frame(self.root)
             top.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
-            ttk.Button(top, text="导入文件夹", command=self.import_folder).pack(side=tk.LEFT, padx=2)
-            ttk.Button(top, text="导入文件", command=self.import_files).pack(side=tk.LEFT, padx=2)
             ttk.Button(top, text="规范素材尺寸", command=self.run_step1).pack(side=tk.LEFT, padx=2)
             ttk.Button(top, text="规范素材图路径", command=lambda: self._open(self.dirs["spec"])).pack(side=tk.LEFT, padx=2)
             ttk.Button(top, text="导出文件夹路径", command=lambda: self._open(self.dirs["out"])).pack(side=tk.LEFT, padx=2)
 
-            # 中部：左画布 + 右面板
+            # 中部三栏：左队列 / 中画布 / 右参数
             mid = ttk.Frame(self.root)
             mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-            left = ttk.Frame(mid)
-            left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            self.canvas = tk.Canvas(left, bg="#1e1e1e", cursor="cross")
+            # ---- 左栏：素材队列 + 导入 ----
+            left = ttk.Frame(mid, width=240)
+            left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+            left.pack_propagate(False)
+            ttk.Label(left, text="素材队列", anchor="w").pack(fill=tk.X, pady=(2, 2))
+            self.queue_list = tk.Listbox(left, exportselection=False)
+            self.queue_list.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+            self.queue_list.bind("<<ListboxSelect>>", self._on_queue_select)
+            lbtn = ttk.Frame(left)
+            lbtn.pack(fill=tk.X, pady=2)
+            ttk.Button(lbtn, text="导入文件夹", command=self.import_folder).pack(fill=tk.X, pady=1)
+            ttk.Button(lbtn, text="导入文件", command=self.import_files).pack(fill=tk.X, pady=1)
+
+            # ---- 中栏：画布 ----
+            center = ttk.Frame(mid)
+            center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.canvas = tk.Canvas(center, bg="#1e1e1e", cursor="cross", takefocus=1)
             self.canvas.pack(fill=tk.BOTH, expand=True)
             self.canvas.bind("<ButtonPress-1>", self.on_down)
             self.canvas.bind("<B1-Motion>", self.on_drag)
             self.canvas.bind("<ButtonRelease-1>", self.on_up)
 
-            right = ttk.Frame(mid, width=320)
+            # ---- 右栏：参数 + 放大预览 ----
+            right = ttk.Frame(mid, width=300)
             right.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
             right.pack_propagate(False)
 
-            ttk.Label(right, text="结果预览", anchor="w").pack(fill=tk.X, pady=(4, 0))
+            ttk.Label(right, text="结果预览（放大）", anchor="w").pack(fill=tk.X, pady=(4, 0))
             self.preview = ttk.Label(right)
             self.preview.pack(pady=2)
             self.info_var = tk.StringVar(value="—")
-            ttk.Label(right, textvariable=self.info_var, anchor="w", wraplength=300).pack(fill=tk.X)
+            ttk.Label(right, textvariable=self.info_var, anchor="w", wraplength=280).pack(fill=tk.X)
 
-            # 套装开关 + 三档编辑
             self.suite_btn = ttk.Button(right, text="", command=self.toggle_suite)
             self.suite_btn.pack(fill=tk.X, pady=(8, 2))
             self._sync_suite_btn()
@@ -338,7 +360,6 @@ def main():
             self.ch.pack(side=tk.LEFT, padx=2)
             ttk.Button(crow, text="设为框", command=self.apply_custom).pack(side=tk.LEFT, padx=2)
 
-            # 变换 + 操作
             ttk.Separator(right).pack(fill=tk.X, pady=4)
             ttk.Button(right, text="↺ 左转90°", command=lambda: self.rotate(90)).pack(fill=tk.X, pady=1)
             ttk.Button(right, text="↻ 右转90°", command=lambda: self.rotate(-90)).pack(fill=tk.X, pady=1)
@@ -352,12 +373,15 @@ def main():
             ttk.Label(fmt, text="质量").pack(side=tk.LEFT, padx=(6, 0))
             ttk.Spinbox(fmt, from_=10, to=100, textvariable=self.quality, width=5).pack(side=tk.LEFT, padx=2)
 
+            ttk.Label(right, text="快捷键：空格 确认 · C 居中 · 1 返工 · 3 精修",
+                      anchor="w", wraplength=280).pack(fill=tk.X, pady=(10, 0))
+
             # 底部状态栏 + 操作按钮
             bottom = ttk.Frame(self.root)
             bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
             ttk.Button(bottom, text="确认裁剪 (空格)", command=self.confirm_crop).pack(side=tk.LEFT, padx=2)
-            ttk.Button(bottom, text="返工 (q)", command=self.rework_prev).pack(side=tk.LEFT, padx=2)
-            ttk.Button(bottom, text="精修 (E)", command=self.retouch_prev).pack(side=tk.LEFT, padx=2)
+            ttk.Button(bottom, text="返工 (1)", command=self.rework_prev).pack(side=tk.LEFT, padx=2)
+            ttk.Button(bottom, text="精修 (3)", command=self.retouch_prev).pack(side=tk.LEFT, padx=2)
             self.progress = ttk.Label(bottom, textvariable=self.progress_var, anchor="w")
             self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
@@ -411,6 +435,24 @@ def main():
             files = list_source_images(self.dirs["spec"])
             # 排除 返工 子文件夹（list_source_images 只列顶层，已天然排除）
             self.queue = [f for f in files if f not in done]
+            self._fill_listbox()
+
+        def _fill_listbox(self):
+            if not hasattr(self, "queue_list"):
+                return
+            self.queue_list.delete(0, tk.END)
+            for f in self.queue:
+                self.queue_list.insert(tk.END, f)
+
+        def _on_queue_select(self, event):
+            sel = self.queue_list.curselection()
+            if not sel:
+                return
+            i = sel[0]
+            if i == self.idx:
+                return
+            self.idx = i
+            self._load_current()
 
         def _focus_rescan(self):
             prev_name = self.img_name
@@ -448,6 +490,14 @@ def main():
             self._draw()
             self._render_preview()
             self.info_var.set(f"[{self.idx+1}/{len(self.queue)}] {name}  {self.img.size[0]}×{self.img.size[1]}")
+            # 同步队列列表高亮
+            if hasattr(self, "queue_list"):
+                try:
+                    self.queue_list.selection_clear(0, tk.END)
+                    self.queue_list.selection_set(self.idx)
+                    self.queue_list.see(self.idx)
+                except Exception:
+                    pass
 
         def _current_box_size(self):
             if self.cfg["suite_on"]:
@@ -511,7 +561,7 @@ def main():
                 out = crop_for_tier(self.img, bw, bh, fx, fy)
             else:
                 out = crop_free(self.img, self.box)
-            pw, ph = 240, 135
+            pw, ph = 280, 158
             out.thumbnail((pw, ph), _RESAMPLE)
             self.preview_tk = ImageTk.PhotoImage(out)
             self.preview.configure(image=self.preview_tk)
@@ -623,7 +673,6 @@ def main():
             self.img = self.img.transpose(Image.FLIP_LEFT_RIGHT)
             fx, fy = self.last_anchor
             self.last_anchor = (1 - fx, fy)
-            self.box = (self.box[0], self.box[1], self.box[2], self.box[3])  # 重算锚点
             self._place_box_default()
             self._draw()
             self._render_preview()
@@ -651,6 +700,10 @@ def main():
             # 从内存队列移除（文件保留，待 FocusIn 重扫时因已存在结果而跳过）
             if self.img_name in self.queue:
                 self.queue.remove(self.img_name)
+                try:
+                    self.queue_list.delete(self.idx)
+                except Exception:
+                    pass
             if self.queue:
                 self.idx = 0
                 self._load_current()
