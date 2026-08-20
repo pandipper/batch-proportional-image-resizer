@@ -325,11 +325,14 @@ def main():
             # ---- 中栏：画布 ----
             center = ttk.Frame(mid)
             center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            self.canvas = tk.Canvas(center, bg="#1e1e1e", cursor="cross", takefocus=1)
+            self.canvas = tk.Canvas(center, bg="#e8e8e8", cursor="cross", takefocus=1,
+                                    highlightthickness=0)
             self.canvas.pack(fill=tk.BOTH, expand=True)
             self.canvas.bind("<ButtonPress-1>", self.on_down)
             self.canvas.bind("<B1-Motion>", self.on_drag)
             self.canvas.bind("<ButtonRelease-1>", self.on_up)
+            self.canvas.bind("<Configure>", self._on_canvas_configure)
+            self._pending_draw = None
 
             # ---- 右栏：参数 + 放大预览 ----
             right = ttk.Frame(mid, width=300)
@@ -676,7 +679,14 @@ def main():
                 self.last_anchor[0], self.last_anchor[1],
                 self.img.size[0], self.img.size[1], bw, bh)
 
+        def _on_canvas_configure(self, event=None):
+            """画布尺寸变化时防抖重绘，让 fit-to-window 始终填满可用空间。"""
+            if self._pending_draw:
+                self.root.after_cancel(self._pending_draw)
+            self._pending_draw = self.root.after(120, self._draw)
+
         def _draw(self):
+            self._pending_draw = None
             if self.img is None:
                 self._clear_canvas()
                 return
