@@ -94,15 +94,15 @@ def list_source_images(folder):
         return []
 
 
-def step1_target_size(iw, ih):
-    """依源图尺寸计算 step1 归一化目标尺寸（返回 (w, h) 或 None 表示保持原图）。
+def step1_target_size(iw, ih, min_width=1280):
+    """依源图尺寸计算 step1 归一化目标尺寸（返回 (w, h)，永不保持原图）。
 
-    规则（与原始 adaptive_image_resizer 一致）：
+    规则：
       按源宽分档：>2560→2560；1920–2560→1920；1280–1920→1280
+      最小档兜底：源宽 < 最小档宽时，**放大到最小档宽**（取消「不放大保护」）
       高度兜底：计算高 <720 时强制高=720、宽按比例重算（优先于宽封顶，允许宽>2560）
-      不放大保护：w<1280 且 h>=720 时保持原尺寸（返回 None）
+      最小档宽由 min_width 控制（GUI 传入 small 档宽，默认 1280）。
     """
-    w = iw
     if iw > 2560:
         w = 2560
     elif iw >= 1920:
@@ -110,7 +110,11 @@ def step1_target_size(iw, ih):
     elif iw >= 1280:
         w = 1280
     else:
-        w = iw  # <1280，后面再判断不放大
+        w = 1280  # 小于最小档宽 → 放大到最小档宽
+
+    # 最小档兜底：保证不低于最小档宽（如用户把 small 档调高，则一并抬升下限）
+    if w < min_width:
+        w = min_width
 
     # 等比缩放
     if iw > 0:
@@ -121,17 +125,13 @@ def step1_target_size(iw, ih):
     # 高度兜底
     if h < 720:
         h = 720
-        if h > 0:
-            w = round(iw * (h / ih)) if ih > 0 else w
-
-    # 不放大保护
-    if iw < 1280 and ih >= 720:
-        return None
+        if ih > 0:
+            w = round(iw * (h / ih))
 
     return (w, h)
 
 
-def process_step1(source_paths, out_dir, quality=90, on_progress=None):
+def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width=1280):
     """对一组源图执行 step1，结果写入 out_dir（同名覆盖）。返回 (成功数, 跳过数)。"""
     ok = 0
     skip = 0
@@ -145,11 +145,8 @@ def process_step1(source_paths, out_dir, quality=90, on_progress=None):
         try:
             with Image.open(src) as im:
                 im = im.convert("RGB")
-                tgt = step1_target_size(*im.size)
-                if tgt is None:
-                    out = im  # 保持原尺寸
-                else:
-                    out = im.resize(tgt, _RESAMPLE)
+                tgt = step1_target_size(*im.size, min_width=min_width)
+                out = im.resize(tgt, _RESAMPLE)
                 base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
                 out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
             ok += 1
@@ -390,7 +387,10 @@ def main():
                 def cb(i, total, src):
                     self.root.after(0, lambda: self.progress_var.set(f"规范素材尺寸 {i}/{total}"))
                 try:
-                    ok, skip = process_step1(self.source_paths, self.dirs["spec"], quality=self.quality.get(), on_progress=cb)
+                    ok, skip = process_step1(
+                        self.source_paths, self.dirs["spec"],
+                        quality=self.quality.get(), on_progress=cb,
+                        min_width=self.cfg["tiers"]["small"]["w"])
                     self.root.after(0, lambda: self.progress_var.set(f"规范素材尺寸完成：成功 {ok}，跳过 {skip}"))
                 except Exception as e:
                     self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
