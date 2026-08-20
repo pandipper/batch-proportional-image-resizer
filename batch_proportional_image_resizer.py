@@ -94,22 +94,25 @@ def list_source_images(folder):
         return []
 
 
-def step1_target_size(iw, ih, target_height=720):
-    """依源图尺寸计算 step1 归一化目标尺寸（返回 (w, h)）。
+def step1_target_size(iw, ih, min_width=1280):
+    """step1 归一化：仅按比例缩放，不裁剪、不拉伸、不锁定高度。
 
-    规则（用户要求「规范为 720 高」）：
-      将图高等比缩放到 target_height（默认取 small 档高 720），宽度按比例。
-      小于该高的图会被放大到该高，大于的图会缩小到该高。
-      这样规范素材图所有图高度一致为 target_height，step2 再用 COVER 缩放裁出各档。
+    规则（用户要求）：
+      宽度不足 min_width（默认取 small 档宽 1280）时，按比例放大到该宽度；
+      宽度已 >= min_width 时保持原尺寸不变。
+      高度随宽度等比，比例始终与原图一致。第二步才用 16:9 框裁剪。
+    返回 (w, h)。
     """
-    if ih <= 0:
-        return (max(1, iw), int(target_height))
-    h = int(target_height)
-    w = round(iw * (h / ih))
-    return (max(1, w), h)
+    if iw <= 0:
+        return (max(1, iw), max(1, int(ih)))
+    if iw < min_width:
+        w = int(min_width)
+        h = round(ih * (w / iw))
+        return (w, max(1, h))
+    return (iw, ih)
 
 
-def process_step1(source_paths, out_dir, quality=90, on_progress=None, target_height=720):
+def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width=1280):
     """对一组源图执行 step1，结果写入 out_dir（同名覆盖）。返回 (成功数, 跳过数)。"""
     ok = 0
     skip = 0
@@ -123,7 +126,7 @@ def process_step1(source_paths, out_dir, quality=90, on_progress=None, target_he
         try:
             with Image.open(src) as im:
                 im = im.convert("RGB")
-                tgt = step1_target_size(*im.size, target_height=target_height)
+                tgt = step1_target_size(*im.size, min_width=min_width)
                 out = im.resize(tgt, _RESAMPLE)
                 base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
                 out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
@@ -528,10 +531,10 @@ def main():
                     ok, skip = process_step1(
                         sources, self.dirs["spec"],
                         quality=self.quality.get(), on_progress=cb,
-                        target_height=self.cfg["tiers"]["small"]["h"])
-                    th = self.cfg["tiers"]["small"]["h"]
+                        min_width=self.cfg["tiers"]["small"]["w"])
+                    mw = self.cfg["tiers"]["small"]["w"]
                     self.root.after(0, lambda: self.progress_var.set(
-                        f"规范素材尺寸完成：成功 {ok}，跳过 {skip}；规范素材图 输出高度统一为 {th}"))
+                        f"规范素材尺寸完成：成功 {ok}，跳过 {skip}；宽度不足 {mw} 的已按比例放大，原比例不变"))
                 except Exception as e:
                     self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
                 finally:
