@@ -403,30 +403,44 @@ def main():
             try:
                 import ctypes
                 from ctypes import wintypes
+
                 WM_DROPFILES = 0x0233
                 GWL_WNDPROC = -4
-                shell32 = ctypes.windll.shell32
                 user32 = ctypes.windll.user32
-                hwnd = self.root.winfo_id()
-                proto = ctypes.WINFUNCTYPE(
-                    ctypes.c_long, ctypes.c_int, ctypes.c_uint, ctypes.c_int, ctypes.c_int)
+                shell32 = ctypes.windll.shell32
 
-                def hook(hWnd, Msg, wParam, lParam):
-                    if Msg == WM_DROPFILES:
-                        hDrop = ctypes.c_int(wParam)
-                        count = shell32.DragQueryFileW(hDrop, 0xFFFFFFFF, 0, 0)
+                # 明确 64 位兼容的类型
+                user32.SetWindowLongPtrW.restype = wintypes.LONG_PTR
+                user32.SetWindowLongPtrW.argtypes = [
+                    wintypes.HWND, ctypes.c_int, wintypes.LONG_PTR]
+
+                WNDPROC = ctypes.WINFUNCTYPE(
+                    wintypes.LRESULT,
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.WPARAM,
+                    wintypes.LPARAM)
+
+                def hook(hwnd, msg, wparam, lparam):
+                    if msg == WM_DROPFILES:
+                        hdrop = wintypes.HANDLE(wparam)
+                        n = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
                         files = []
-                        for i in range(count):
+                        for i in range(n):
                             buf = ctypes.create_unicode_buffer(1024)
-                            shell32.DragQueryFileW(hDrop, i, buf, 1024)
+                            shell32.DragQueryFileW(hdrop, i, buf, 1024)
                             files.append(buf.value)
-                        shell32.DragFinish(hDrop)
+                        shell32.DragFinish(hdrop)
                         self.root.after(0, lambda: self._on_drop(files))
                         return 0
-                    return user32.CallWindowProcW(self._orig_wndproc, hWnd, Msg, wParam, lParam)
+                    return self._old_call(hwnd, msg, wparam, lparam)
 
-                self._drop_hook = proto(hook)
-                self._orig_wndproc = user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, self._drop_hook)
+                self._drop_hook = WNDPROC(hook)
+                hwnd = self.root.winfo_id()
+                self._old_winproc = user32.SetWindowLongPtrW(
+                    hwnd, GWL_WNDPROC, self._drop_hook)
+                # 把旧 wndproc 地址转成可调用对象，避免 ctypes 把裸 int 当 32 位传
+                self._old_call = WNDPROC(self._old_winproc)
                 shell32.DragAcceptFiles(hwnd, True)
             except Exception:
                 pass  # 非 Windows 或不支持则静默忽略，仍可用导入按钮
