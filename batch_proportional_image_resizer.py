@@ -488,23 +488,50 @@ def main():
                 self._load_current()  # 同步画布到新选中的图
 
         # ---------------- step1 ----------------
+        def _resolve_step1_sources(self):
+            """确定 step1 要处理的源图，按优先级回退，避免『点了没反应』。
+
+            1) 已导入的源队列（self.source_paths）
+            2) 素材图/ 文件夹（原图素材，按设计不改动）
+            3) 规范素材图/ 自身（二次归一化，原地覆盖）
+            返回 (sources_list, 来源说明文字)
+            """
+            if self.source_paths:
+                return list(self.source_paths), "导入队列"
+            mat = os.path.join(self.work_dir, "素材图")
+            if os.path.isdir(mat):
+                cand = [os.path.join(mat, n) for n in list_source_images(mat)]
+                if cand:
+                    return cand, "素材图"
+            cand = [os.path.join(self.dirs["spec"], n) for n in list_source_images(self.dirs["spec"])]
+            if cand:
+                return cand, "规范素材图（重新归一化）"
+            return [], ""
+
         def run_step1(self):
-            if not self.source_paths:
-                messagebox.showinfo("提示", "请先导入图片（文件夹或文件）。")
+            sources, label = self._resolve_step1_sources()
+            if not sources:
+                messagebox.showinfo(
+                    "提示",
+                    "没有可处理的图片。请先『导入文件夹/导入文件』，\n"
+                    "或把原图放到程序目录下的「素材图」文件夹，再点此按钮。")
                 return
-            self.progress_var.set("规范素材尺寸：准备中…")
+            self._step1_label = label
+            self.progress_var.set(f"规范素材尺寸：处理「{label}」共 {len(sources)} 张…")
             self.root.config(cursor="watch")
             import threading
 
             def worker():
                 def cb(i, total, src):
-                    self.root.after(0, lambda: self.progress_var.set(f"规范素材尺寸 {i}/{total}"))
+                    self.root.after(0, lambda: self.progress_var.set(f"规范素材尺寸 {i}/{total}（来源：{label}）"))
                 try:
                     ok, skip = process_step1(
-                        self.source_paths, self.dirs["spec"],
+                        sources, self.dirs["spec"],
                         quality=self.quality.get(), on_progress=cb,
                         target_height=self.cfg["tiers"]["small"]["h"])
-                    self.root.after(0, lambda: self.progress_var.set(f"规范素材尺寸完成：成功 {ok}，跳过 {skip}"))
+                    th = self.cfg["tiers"]["small"]["h"]
+                    self.root.after(0, lambda: self.progress_var.set(
+                        f"规范素材尺寸完成：成功 {ok}，跳过 {skip}；规范素材图 输出高度统一为 {th}"))
                 except Exception as e:
                     self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
                 finally:
