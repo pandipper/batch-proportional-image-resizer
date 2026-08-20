@@ -600,10 +600,7 @@ def main():
             if not sel:
                 return
             i = sel[0]
-            if self.mode == "import":
-                self.idx = i  # 导入态：仅记录选择，未归一化不加载
-                return
-            if i == self.idx:
+            if i == self.idx and self.img is not None:
                 return
             self.idx = i
             self._load_current()
@@ -630,8 +627,26 @@ def main():
         # ---------------- 加载/绘制 ----------------
         def _load_current(self):
             if self.mode == "import":
-                self._clear_canvas()
-                self.info_var.set("导入模式：点击「规范素材尺寸」生成规范素材图后再裁剪。")
+                if not self.source_paths:
+                    self._clear_canvas()
+                    self.info_var.set("导入模式：点击「规范素材尺寸」生成规范素材图后再裁剪。")
+                    return
+                self.idx = max(0, min(self.idx, len(self.source_paths) - 1))
+                path = self.source_paths[self.idx]
+                name = os.path.basename(path)
+                try:
+                    with Image.open(path) as im:
+                        self.img = im.convert("RGB")
+                except Exception as e:
+                    messagebox.showerror("无法打开", f"{name}\n{e}")
+                    return
+                self.img_name = name
+                self.manual_tier = None
+                self._place_box_default()
+                self._draw()
+                self._render_preview()
+                self.info_var.set(f"导入预览 [{self.idx+1}/{len(self.source_paths)}] {name}  {self.img.size[0]}×{self.img.size[1]}  —— 点击「规范素材尺寸」开始裁剪")
+                self._sync_queue_selection()
                 return
             if not self.queue:
                 self._clear_canvas()
@@ -846,6 +861,9 @@ def main():
             self._render_preview()
 
         def confirm_crop(self):
+            if self.mode == "import":
+                self.progress_var.set("导入模式：请先点击「规范素材尺寸」生成规范素材图，再开始裁剪。")
+                return
             if self.img is None or not self.img_name:
                 return
             bw, bh = self._current_box_size()
