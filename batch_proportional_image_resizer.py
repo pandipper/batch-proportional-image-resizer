@@ -221,10 +221,8 @@ def main():
             self.config_path = os.path.join(self.work_dir, "config.json")
             self.cfg = load_config(self.config_path)
             self.dirs = ensure_dirs(self.work_dir)
-            # 启动模式：若规范素材图已有图，直接进入裁剪态；否则进入导入态
-            self.mode = "crop" if list_source_images(self.dirs["spec"]) else "import"
 
-            self.source_paths = []          # 任意位置源图
+            self.source_paths = []          # 任意位置源图（导入列表，独立于队列）
             self.queue = []                 # 规范素材图 顶层图片文件名
             self.idx = 0                    # 当前队列下标
             self.img = None                 # 当前 PIL 图（含变换）
@@ -247,6 +245,10 @@ def main():
             self.preview_tk = None
 
             self._build_ui()
+            # 启动状态：若规范素材图已有图，在导入板块直接反映
+            n_spec = len(list_source_images(self.dirs["spec"]))
+            if n_spec:
+                self.norm_status_var.set(f"规范素材图已存在（{n_spec} 张）")
             self._refresh_queue()
             self._focus_rescan()  # 首次加载
             self.root.bind("<FocusIn>", self._on_focus_in)
@@ -303,6 +305,22 @@ def main():
             left = ttk.Frame(mid, width=240)
             left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
             left.pack_propagate(False)
+
+            # ---- 导入 / 规范 板块 ----
+            imp = ttk.LabelFrame(left, text="导入 / 规范素材")
+            imp.pack(fill=tk.X, pady=(2, 4))
+            ib = ttk.Frame(imp)
+            ib.pack(fill=tk.X, padx=4, pady=2)
+            ttk.Button(ib, text="导入文件夹", command=self.import_folder).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+            ttk.Button(ib, text="导入文件", command=self.import_files).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
+            self.import_status_var = tk.StringVar(value="已导入 0 条素材图")
+            ttk.Label(imp, textvariable=self.import_status_var, anchor="w",
+                      font=("TkDefaultFont", 9)).pack(fill=tk.X, padx=4, pady=(2, 0))
+            self.norm_status_var = tk.StringVar(value="尚未生成规范素材图")
+            ttk.Label(imp, textvariable=self.norm_status_var, anchor="w",
+                      font=("TkDefaultFont", 9)).pack(fill=tk.X, padx=4, pady=(0, 4))
+
+            # ---- 素材队列（仅展示规范素材图/ 内容）----
             self.queue_title = ttk.Label(left, text="素材队列", anchor="w")
             self.queue_title.pack(fill=tk.X, pady=(2, 2))
             self.queue_list = tk.Listbox(left, exportselection=False)
@@ -313,12 +331,8 @@ def main():
             obtn.pack(fill=tk.X, pady=1)
             ttk.Button(obtn, text="↑ 上移", command=self.move_up).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
             ttk.Button(obtn, text="↓ 下移", command=self.move_down).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
-            lbtn = ttk.Frame(left)
-            lbtn.pack(fill=tk.X, pady=2)
-            ttk.Button(lbtn, text="导入文件夹", command=self.import_folder).pack(fill=tk.X, pady=1)
-            ttk.Button(lbtn, text="导入文件", command=self.import_files).pack(fill=tk.X, pady=1)
             ttk.Label(left, text="（可从资源管理器拖拽图片到本窗口导入）", anchor="w",
-                      wraplength=230, font=("TkDefaultFont", 8)).pack(fill=tk.X, pady=(4, 0))
+                      wraplength=250, font=("TkDefaultFont", 8)).pack(fill=tk.X, pady=(4, 0))
             # 注册系统拖放（Windows）；非 Windows 静默忽略
             self._enable_drop_target()
 
@@ -404,29 +418,27 @@ def main():
             self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
         # ---------------- 导入 ----------------
+        def _update_import_status(self):
+            n = len(self.source_paths)
+            self.import_status_var.set(f"已导入 {n} 条素材图")
+
         def import_folder(self):
             d = filedialog.askdirectory(title="选择源图片文件夹")
             if d:
                 self.source_paths = [os.path.join(d, n) for n in list_source_images(d)]
-                self.mode = "import"
-                self._clear_canvas()
-                self.img = None
-                self.img_name = None
-                self._fill_listbox()
-                self.progress_var.set(f"已导入文件夹：{len(self.source_paths)} 张（源图保留在原位置）")
+                self._update_import_status()
+                self.progress_var.set(f"已导入文件夹：{len(self.source_paths)} 张（源图保留在原位置）。点「规范素材尺寸」生成规范素材图。")
+            if not self.queue:
+                self._show_import_preview()
 
         def import_files(self):
             fs = filedialog.askopenfilenames(title="选择图片文件", filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
             if fs:
                 self.source_paths = list(fs)  # 替换当前源
-                self.mode = "import"
-                self._clear_canvas()
-                self.img = None
-                self.img_name = None
-                self._fill_listbox()
-                self.progress_var.set(f"已导入文件：{len(self.source_paths)} 张")
-
-        # ---------------- 系统拖放（Windows WM_DROPFILES）----------------
+                self._update_import_status()
+                self.progress_var.set(f"已导入文件：{len(self.source_paths)} 张。点「规范素材尺寸」生成规范素材图。")
+            if not self.queue:
+                self._show_import_preview()
         def _enable_drop_target(self):
             try:
                 import ctypes
@@ -478,13 +490,11 @@ def main():
             if not imgs:
                 return
             self.source_paths = list(self.source_paths) + imgs  # 追加导入
-            self.mode = "import"
-            self._clear_canvas()
-            self.img = None
-            self.img_name = None
-            self._fill_listbox()
+            self._update_import_status()
             self.progress_var.set(
                 f"已拖入 {len(imgs)} 张，导入队列共 {len(self.source_paths)} 张；点击「规范素材尺寸」生成规范素材图。")
+            if not self.queue:
+                self._show_import_preview()
 
         # ---------------- 顺序调整 ----------------
         def move_up(self):
@@ -494,7 +504,7 @@ def main():
             self._reorder(1)
 
         def _reorder(self, delta):
-            lst = self.source_paths if self.mode == "import" else self.queue
+            lst = self.queue
             if not lst:
                 return
             sel = self.queue_list.curselection()
@@ -512,8 +522,7 @@ def main():
                 self.queue_list.see(j)
             except Exception:
                 pass
-            if self.mode == "crop":
-                self._load_current()  # 同步画布到新选中的图
+            self._load_current()  # 同步画布到新选中的图
 
         # ---------------- step1 ----------------
         def _resolve_step1_sources(self):
@@ -526,11 +535,6 @@ def main():
             """
             if self.source_paths:
                 return list(self.source_paths), "导入队列"
-            mat = os.path.join(self.work_dir, "素材图")
-            if os.path.isdir(mat):
-                cand = [os.path.join(mat, n) for n in list_source_images(mat)]
-                if cand:
-                    return cand, "素材图"
             cand = [os.path.join(self.dirs["spec"], n) for n in list_source_images(self.dirs["spec"])]
             if cand:
                 return cand, "规范素材图（重新归一化）"
@@ -541,8 +545,8 @@ def main():
             if not sources:
                 messagebox.showinfo(
                     "提示",
-                    "没有可处理的图片。请先『导入文件夹/导入文件』，\n"
-                    "或把原图放到程序目录下的「素材图」文件夹，再点此按钮。")
+                    "没有可处理的图片。\n"
+                    "请先点左侧「导入文件夹 / 导入文件」把图片加入导入队列，再点此按钮。")
                 return
             self._step1_label = label
             self.progress_var.set(f"规范素材尺寸：处理「{label}」共 {len(sources)} 张…")
@@ -569,7 +573,10 @@ def main():
 
         def _after_step1(self):
             self.root.config(cursor="")
-            self.mode = "crop"
+            # 这批导入源已处理为规范素材图，清空导入列表并刷新状态
+            self.source_paths = []
+            self._update_import_status()
+            self.norm_status_var.set("规范素材图已生成，可在下方素材队列裁剪")
             self._refresh_queue()
             self.idx = 0
             self._load_current()
@@ -586,14 +593,10 @@ def main():
             if not hasattr(self, "queue_list"):
                 return
             self.queue_list.delete(0, tk.END)
-            if self.mode == "import":
-                self.queue_title.configure(text=f"素材导入队列（{len(self.source_paths)}）")
-                for f in self.source_paths:
-                    self.queue_list.insert(tk.END, os.path.basename(f))
-            else:
-                self.queue_title.configure(text=f"素材队列（{len(self.queue)}）")
-                for f in self.queue:
-                    self.queue_list.insert(tk.END, f)
+            total = len(list_source_images(self.dirs["spec"]))
+            self.queue_title.configure(text=f"素材队列（待裁剪 {len(self.queue)} / 共 {total}）")
+            for f in self.queue:
+                self.queue_list.insert(tk.END, f)
 
         def _on_queue_select(self, event):
             sel = self.queue_list.curselection()
@@ -606,9 +609,6 @@ def main():
             self._load_current()
 
         def _focus_rescan(self):
-            if self.mode == "import":
-                self._fill_listbox()
-                return
             prev_name = self.img_name
             self._refresh_queue()
             if not self.queue:
@@ -626,30 +626,9 @@ def main():
 
         # ---------------- 加载/绘制 ----------------
         def _load_current(self):
-            if self.mode == "import":
-                if not self.source_paths:
-                    self._clear_canvas()
-                    self.info_var.set("导入模式：点击「规范素材尺寸」生成规范素材图后再裁剪。")
-                    return
-                self.idx = max(0, min(self.idx, len(self.source_paths) - 1))
-                path = self.source_paths[self.idx]
-                name = os.path.basename(path)
-                try:
-                    with Image.open(path) as im:
-                        self.img = im.convert("RGB")
-                except Exception as e:
-                    messagebox.showerror("无法打开", f"{name}\n{e}")
-                    return
-                self.img_name = name
-                self.manual_tier = None
-                self._place_box_default()
-                self._draw()
-                self._render_preview()
-                self.info_var.set(f"导入预览 [{self.idx+1}/{len(self.source_paths)}] {name}  {self.img.size[0]}×{self.img.size[1]}  —— 点击「规范素材尺寸」开始裁剪")
-                self._sync_queue_selection()
-                return
             if not self.queue:
                 self._clear_canvas()
+                self.info_var.set("素材队列为空：请先导入图片并点「规范素材尺寸」生成规范素材图，或在下方队列出现后再裁剪。")
                 return
             self.idx = max(0, min(self.idx, len(self.queue) - 1))
             name = self.queue[self.idx]
@@ -674,6 +653,26 @@ def main():
                     self.queue_list.see(self.idx)
                 except Exception:
                     pass
+
+        def _show_import_preview(self):
+            """导入后队列（规范素材图）为空时，画布只读预览第一张导入源图。"""
+            if not self.source_paths:
+                return
+            path = self.source_paths[0]
+            name = os.path.basename(path)
+            try:
+                with Image.open(path) as im:
+                    self.img = im.convert("RGB")
+            except Exception as e:
+                messagebox.showerror("无法打开", f"{name}\n{e}")
+                return
+            self.img_name = name
+            self.manual_tier = None
+            self._place_box_default()
+            self._draw()
+            self._render_preview()
+            self.info_var.set(
+                f"导入预览 {name}  {self.img.size[0]}×{self.img.size[1]}  —— 点「规范素材尺寸」生成规范素材图后再裁剪")
 
         def _current_box_size(self):
             if self.cfg["suite_on"]:
@@ -861,10 +860,10 @@ def main():
             self._render_preview()
 
         def confirm_crop(self):
-            if self.mode == "import":
-                self.progress_var.set("导入模式：请先点击「规范素材尺寸」生成规范素材图，再开始裁剪。")
-                return
             if self.img is None or not self.img_name:
+                return
+            if self.img_name not in self.queue:
+                self.progress_var.set("该图尚未进入素材队列（规范素材图），请先「规范素材尺寸」再裁剪。")
                 return
             bw, bh = self._current_box_size()
             fx, fy = self._box_anchor()
