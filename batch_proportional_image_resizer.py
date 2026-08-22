@@ -18,7 +18,7 @@ import shutil
 import math
 import webbrowser
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # ---- 重采样兼容垫片（Pillow 10+ 改用 Resampling，旧版用 Image.LANCZOS）----
 try:
@@ -29,15 +29,70 @@ except AttributeError:  # Pillow < 9.1
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 DEFAULT_TIERS = {
-    "large":  {"w": 2560, "h": 1440, "label": "大"},
-    "medium": {"w": 1920, "h": 1080, "label": "中"},
-    "small":  {"w": 1280, "h": 720,  "label": "小"},
+    "large": {"w": 2560, "h": 1440, "label": "大档"},
+    "small": {"w": 1280, "h": 720,  "label": "小档"},
 }
 
 DEFAULT_CONFIG = {
-    "suite_on": True,
+    "active_tier": "large",
+    "ratio_lock": True,
+    "ratio": [16, 9],
     "tiers": {k: dict(v) for k, v in DEFAULT_TIERS.items()},
 }
+
+
+# ===================== 主题 / 皮肤 =====================
+# THEME_ON = False 时为「纯工具风」（默认），仅用 ttk.Style 染色；
+#           True 时叠加参考素材库（背景图 / 裁剪框外框 / 开关皮肤）。
+THEME_ON = True
+ASSET_DIR = r"D:\Program Files\workbuddycn\2026-08-19-16-26-07\供参考的ui"
+ASSET = {
+    "bg":        os.path.join(ASSET_DIR, "ui", "button", "background.png"),   # 窗口背景（舞台/月洞门）
+    "kuang":     os.path.join(ASSET_DIR, "frame", "kuang2.png"),               # 裁剪框外框（金边切角）
+    "kg_on":     os.path.join(ASSET_DIR, "ui", "button", "kg_on.png"),         # 开关 on
+    "kg_off":    os.path.join(ASSET_DIR, "ui", "button", "kg_off.png"),        # 开关 off
+}
+
+# 设计 Token（与 spec 第 5 节一致；ttk.Style 在 App._apply_theme 应用）
+THEME = {
+    "PRIMARY":   "#185FA5",
+    "PRIMARY_H": "#0C447C",
+    "BG":        "#FFFFFF",
+    "SURFACE":   "#F4EFE6",   # 暖米色，与金边/木纹素材调子搭
+    "BORDER":    "#C9BFA8",
+    "TEXT":      "#2C2C2A",
+    "MUTED":     "#6B665A",
+    "HINT":      "#9C9785",
+}
+
+
+# ---------------- stdout 重定向（左下角运行日志面板）----------------
+class _LogRedirector:
+    """把 sys.stdout / sys.stderr 重定向到只读 Text 控件。
+
+    注意：本类定义在模块顶层，而 `import tkinter as tk` 是 main() 内的局部变量，
+    模块全局作用域里查不到 `tk`。因此这里一律用字面量 "end"（tkinter 的 END 常量
+    本就等于 "end"），避免 write() 触发 NameError 被静默吞掉、导致日志面板始终为空。
+    """
+    def __init__(self, widget):
+        self._w = widget
+    def write(self, s):
+        try:
+            w = self._w
+            w.configure(state="normal")
+            w.insert("end", s)
+            try:  # 限制行数（>500 行删首行），避免无限增长
+                n = int(w.index("end-1c").split(".")[0])
+                if n > 500:
+                    w.delete("1.0", "2.0")
+            except Exception:
+                pass
+            w.see("end")
+            w.configure(state="disabled")
+        except Exception:
+            pass  # 控件已销毁等情况静默忽略
+    def flush(self):
+        pass
 
 
 # ===================== 纯逻辑函数（无 tkinter 依赖，可单测）=====================
@@ -53,12 +108,16 @@ def load_config(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            cfg.setdefault("suite_on", True)
+            cfg.setdefault("active_tier", "large")
+            cfg.setdefault("ratio_lock", True)
+            cfg.setdefault("ratio", [16, 9])
             t = cfg.get("tiers", {})
-            for k in ("large", "medium", "small"):
+            for k in ("large", "small"):
                 if k in t and "w" in t[k] and "h" in t[k]:
                     DEFAULT_TIERS[k]["w"] = int(t[k]["w"])
                     DEFAULT_TIERS[k]["h"] = int(t[k]["h"])
+            if cfg.get("active_tier") not in DEFAULT_TIERS:
+                cfg["active_tier"] = "large"
             return cfg
         except Exception:
             pass
@@ -94,25 +153,30 @@ def list_source_images(folder):
         return []
 
 
-def step1_target_size(iw, ih, min_width=1280):
-    """step1 归一化：仅按比例缩放，不裁剪、不拉伸、不锁定高度。
+def step1_target_size(iw, ih, tiers=None, min_width=1280, max_width=2560):
+    """step1 归一化（COVER 覆盖式）：把原图缩放到「覆盖 large 档 16:9 裁框」，
+    保留原比例、不裁切，输出完整缩放图（溢出部分留在规范素材图里，供 step2 平移取景）。
 
-    规则（用户要求）：
-      宽度不足 min_width（默认取 small 档宽 1280）时，按比例放大到该宽度；
-      宽度已 >= min_width 时保持原尺寸不变。
-      高度随宽度等比，比例始终与原图一致。第二步才用 16:9 框裁剪。
-    返回 (w, h)。
+    效果（满足「宽或高有一边与裁框贴边、最大限度保留原画面」）：
+      scale = max(large.w/iw, large.h/ih)
+        scale > 1：原图放大到至少 large 档（小图不会过小）
+        scale < 1：原图缩小到至多 large 档（大图不会过大）
+        scale == 1：原尺寸不动
+      缩放后必有一边 == large 档对应边（与 16:9 裁框贴边），另一边 >=（溢出），
+      因此 step2 的 16:9 裁框始终有平移/取景空间，且原画面被完整保留。
+    返回 (w, h)（保持原图比例）。
     """
-    if iw <= 0:
-        return (max(1, iw), max(1, int(ih)))
-    if iw < min_width:
-        w = int(min_width)
-        h = round(ih * (w / iw))
-        return (w, max(1, h))
-    return (iw, ih)
+    if iw <= 0 or ih <= 0:
+        return (max(1, iw), max(1, ih))
+    large = (tiers or {}).get("large") or {"w": max_width, "h": int(max_width * 9 / 16)}
+    lw, lh = large["w"], large["h"]
+    scale = max(lw / iw, lh / ih)   # COVER：limiting 维度贴边 large 档，另一维溢出
+    w = max(1, int(round(iw * scale)))
+    h = max(1, int(round(ih * scale)))
+    return (w, h)
 
 
-def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width=1280):
+def process_step1(source_paths, out_dir, quality=90, on_progress=None, tiers=None, min_width=1280):
     """对一组源图执行 step1，结果写入 out_dir（同名覆盖）。返回 (成功数, 跳过数)。"""
     ok = 0
     skip = 0
@@ -126,7 +190,7 @@ def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width
         try:
             with Image.open(src) as im:
                 im = im.convert("RGB")
-                tgt = step1_target_size(*im.size, min_width=min_width)
+                tgt = step1_target_size(*im.size, tiers=tiers, min_width=min_width)
                 out = im.resize(tgt, _RESAMPLE)
                 base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
                 out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
@@ -136,17 +200,8 @@ def process_step1(source_paths, out_dir, quality=90, on_progress=None, min_width
     return ok, skip
 
 
-def pick_tier_auto(iw, ih, tiers):
-    """套装开自动选档：在「源图能完整覆盖该档（不放大）」的前提下取最大档；
-    若源图比所有档都小，则取最小档（避免把小图放大到超大尺寸）。
-    例：1280×1280 这类小图落到 小档(1280×720) 而非被放大到 大档(2560×1440)。
-    """
-    ordered = sorted(tiers.items(), key=lambda kv: kv[1]["h"], reverse=True)
-    for k, t in ordered:
-        if iw >= t["w"] and ih >= t["h"]:
-            return k
-    # 源图比所有档都小：取最小档
-    return min(tiers.items(), key=lambda kv: kv[1]["h"])[0]
+# 自动选档逻辑已移除：大档/小档改为手动单选（见 App._set_tier_active）。
+
 
 
 def cover_scale(iw, ih, bw, bh):
@@ -229,12 +284,16 @@ def main():
             self.img_name = None
             self.box = (0, 0, 0, 0)         # 图像坐标裁剪框
             self.last_anchor = (0.5, 0.5)
-            self.manual_tier = None         # 用户点击预设后的覆盖档
-            self.custom = {"w": 1920, "h": 1080}
+            r = self.cfg.get("ratio", [16, 9])
+            self.ratio_w = tk.IntVar(value=int(r[0]))
+            self.ratio_h = tk.IntVar(value=int(r[1]))
+            self.active_tier = self.cfg.get("active_tier", "large")   # 当前生效档（大档/小档，单选）
+            self.ratio_lock = self.cfg.get("ratio_lock", True)        # 纵横比联动：四值保持同一比例
             self.prev_src = None            # 上一张：源文件路径
             self.prev_result = None         # 上一张：结果文件路径
-            self.quality = tk.IntVar(value=90)
+            self.quality = tk.IntVar(value=100)
             self.out_format = tk.StringVar(value="JPEG")
+            self.info_var = tk.StringVar(value="—")
             self.progress_var = tk.StringVar(value="")
 
             # 画布显示参数
@@ -244,11 +303,13 @@ def main():
             self.tk_img = None
             self.preview_tk = None
 
+            # 步进箭头图标（像素级等大、左右镜像，避免 Unicode 字形一大一小）
+            self._arrow_left = self._make_arrow("left")
+            self._arrow_right = self._make_arrow("right")
+
+            self._apply_theme()  # ttk.Style 必须在 _build_ui 之前配好
             self._build_ui()
-            # 启动状态：若规范素材图已有图，在导入板块直接反映
-            n_spec = len(list_source_images(self.dirs["spec"]))
-            if n_spec:
-                self.norm_status_var.set(f"规范素材图已存在（{n_spec} 张）")
+            self._init_background()  # 背景图必须 _build_ui 之后（pack 子控件先入栈，再 lower 到最底层）
             self._refresh_queue()
             self._focus_rescan()  # 首次加载
             self.root.bind("<FocusIn>", self._on_focus_in)
@@ -261,6 +322,144 @@ def main():
             self.root.bind("<c>", self._kbd(self.center_box))
             self.root.bind("1", self._kbd(self.rework_prev))
             self.root.bind("3", self._kbd(self.retouch_prev))
+            # 窗口映射前画布尺寸为 0/1，首次 _draw 会跳过；映射后延迟触发一次真实重绘
+            self.root.after(60, self._draw)
+
+        # ---------------- 主题 / 皮肤 ----------------
+        def _make_arrow(self, direction, size=14):
+            """生成与滚动条箭头风格一致的「等大三角形」图标（透明背景 RGBA）。
+
+            用 PIL 画像素级等大的实心三角形，左右/上下仅互为镜像 —— 彻底规避
+            Unicode 字符 ◀▶ / ▲▼ 在不同字体下字形大小/视觉重量不一致导致的「一大一小」。
+            direction: "left" / "right"。color 默认取主题 TEXT 色。
+            """
+            img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            fg = THEME["TEXT"]
+            r, g, b = int(fg[1:3], 16), int(fg[3:5], 16), int(fg[5:7], 16)
+            m = 3  # 边距，避免顶到按钮边缘
+            c = (size - 1) // 2  # 中轴
+            if direction == "left":
+                pts = [(size - 1 - m, m), (size - 1 - m, size - 1 - m), (m, c)]
+            elif direction == "right":
+                pts = [(m, m), (m, size - 1 - m), (size - 1 - m, c)]
+            else:
+                raise ValueError(direction)
+            d.polygon(pts, fill=(r, g, b, 255))
+            return ImageTk.PhotoImage(img)
+
+        def _apply_theme(self):
+            """ttk.Style 套用 Token（必须在 _build_ui 之前调用）。"""
+            try:
+                style = ttk.Style(self.root)
+                try:
+                    style.theme_use("clam")  # 跨平台可预测的样式基底
+                except tk.TclError:
+                    pass
+                T = THEME
+                style.configure(".", font=("Segoe UI", 10))
+                style.configure("TFrame", background=T["SURFACE"])
+                style.configure("Card.TFrame", background=T["BG"])
+                style.configure("TLabel", background=T["SURFACE"], foreground=T["TEXT"])
+                style.configure("Card.TLabel", background=T["BG"], foreground=T["TEXT"])
+                style.configure("Muted.TLabel", background=T["SURFACE"], foreground=T["MUTED"])
+                style.configure("Hint.TLabel", background=T["SURFACE"], foreground=T["HINT"])
+                # Primary：实心主色
+                style.configure("Primary.TButton", background=T["PRIMARY"], foreground="white",
+                                borderwidth=0, padding=(14, 6))
+                style.map("Primary.TButton",
+                          background=[("active", T["PRIMARY_H"]), ("hover", T["PRIMARY_H"])])
+                # Secondary：描边
+                style.configure("Secondary.TButton", background=T["SURFACE"], foreground=T["TEXT"],
+                                borderwidth=1, padding=(8, 4))
+                style.map("Secondary.TButton", background=[("active", T["BG"])])
+                # Stepper：夹逼范围步进箭头（◀ ▶），无方框感，参照默认滚动条箭头
+                # borderwidth=0、padding 小，只露箭头字符；hover 时给一点底色
+                style.configure("Stepper.TButton",
+                                background=T["SURFACE"],
+                                foreground=T["TEXT"],
+                                borderwidth=0,
+                                relief="flat",
+                                padding=(4, 2))
+                style.map("Stepper.TButton",
+                          background=[("active", T["BG"]), ("pressed", T["BG"])],
+                          foreground=[("active", T["PRIMARY"]), ("pressed", T["PRIMARY"])])
+                # Ghost：文字按钮
+                style.configure("Ghost.TButton", background=T["SURFACE"], foreground=T["PRIMARY"],
+                                borderwidth=0, padding=(4, 2))
+                # 焦点环
+                try:
+                    style.configure("TButton", focuscolor=T["PRIMARY"])
+                except tk.TclError:
+                    pass
+            except Exception:
+                pass  # 主题失败不影响功能
+
+        def _init_background(self):
+            """THEME_ON 时在 root 铺一张缩放后的背景图（必须在 _build_ui 之后调用，
+            使 pack 子控件先入栈，place 的背景再 lower 到最底层）。"""
+            self._bg_label = None
+            self._bg_image = None
+            if not THEME_ON:
+                return
+            if not os.path.isfile(ASSET["bg"]):
+                return
+            try:
+                from PIL import Image
+                self._bg_full = Image.open(ASSET["bg"])
+                self._bg_label = tk.Label(self.root, bd=0, highlightthickness=0, borderwidth=0)
+                self._bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+                self._bg_label.lower()
+                self._draw_bg()
+                self._bg_label.bind("<Configure>", lambda e: self._draw_bg())
+            except Exception:
+                self._bg_label = None
+
+        def _draw_bg(self):
+            if not getattr(self, "_bg_label", None) or not getattr(self, "_bg_full", None):
+                return
+            try:
+                from PIL import ImageTk
+                w = max(1, self._bg_label.winfo_width())
+                h = max(1, self._bg_label.winfo_height())
+                if w < 2 or h < 2:
+                    return
+                # 保持比例 cover 缩放
+                src_w, src_h = self._bg_full.size
+                scale = max(w / src_w, h / src_h)
+                nw, nh = max(1, int(src_w * scale)), max(1, int(src_h * scale))
+                bg = self._bg_full.resize((nw, nh), _RESAMPLE)
+                # 居中裁
+                x0 = (nw - w) // 2
+                y0 = (nh - h) // 2
+                bg = bg.crop((x0, y0, x0 + w, y0 + h))
+                self._bg_image = ImageTk.PhotoImage(bg)
+                self._bg_label.configure(image=self._bg_image)
+            except Exception:
+                pass
+
+        def _kuang_underlay(self, x0, y0, x1, y1):
+            """THEME_ON 时在裁剪框底层画一张半透明 kuang2，作为装饰外框。"""
+            if not THEME_ON or not os.path.isfile(ASSET["kuang"]):
+                return
+            try:
+                from PIL import Image
+                w, h = max(2, x1 - x0), max(2, y1 - y0)
+                if w < 4 or h < 4:
+                    return
+                kuang = Image.open(ASSET["kuang"]).convert("RGBA")
+                # 缩放并半透明
+                kuang = kuang.resize((w, h), _RESAMPLE)
+                # 降低 alpha（叠加而非遮挡）
+                r, g, b, a = kuang.split()
+                a = a.point(lambda p: int(p * 0.55))
+                kuang = Image.merge("RGBA", (r, g, b, a))
+                from PIL import ImageTk
+                self._kuang_tk = ImageTk.PhotoImage(kuang)
+                # 用 tag 区分，_draw 起手会 delete("all")
+                self.canvas.create_image(x0, y0, image=self._kuang_tk, anchor="nw", tag="kuang")
+            except Exception:
+                pass
 
         # ---------------- 快捷键焦点感知 ----------------
         def _kbd(self, action):
@@ -288,59 +487,133 @@ def main():
             except Exception:
                 pass
 
-        # ---------------- UI（三栏）----------------
+        # ---------------- UI（新布局：顶栏动作 + 左可滚动竖列 + 中画布）----------------
         def _build_ui(self):
-            # 顶部工具栏：全局动作
+            # 顶部工具栏：左组=导入/规范，右组=裁剪操作
             top = ttk.Frame(self.root)
             top.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
-            ttk.Button(top, text="规范素材尺寸", command=self.run_step1).pack(side=tk.LEFT, padx=2)
-            ttk.Button(top, text="规范素材图路径", command=lambda: self._open(self.dirs["spec"])).pack(side=tk.LEFT, padx=2)
-            ttk.Button(top, text="导出文件夹路径", command=lambda: self._open(self.dirs["out"])).pack(side=tk.LEFT, padx=2)
+            ttk.Button(top, text="规范素材尺寸", style="Primary.TButton", command=self.run_step1).pack(side=tk.LEFT, padx=(2, 8))
+            ttk.Button(top, text="规范素材图路径", style="Secondary.TButton", command=lambda: self._open(self.dirs["spec"])).pack(side=tk.LEFT, padx=2)
+            ttk.Button(top, text="导出文件夹路径", style="Secondary.TButton", command=lambda: self._open(self.dirs["out"])).pack(side=tk.LEFT, padx=2)
+            ttk.Separator(top, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
+            ttk.Button(top, text="确认裁剪", style="Primary.TButton", command=self.confirm_crop).pack(side=tk.LEFT, padx=(2, 8))
+            ttk.Button(top, text="返工", style="Secondary.TButton", command=self.rework_prev).pack(side=tk.LEFT, padx=2)
+            ttk.Button(top, text="精修", style="Secondary.TButton", command=self.retouch_prev).pack(side=tk.LEFT, padx=2)
 
-            # 中部三栏：左队列 / 中画布 / 右参数
+            # 中部：左可滚动竖列 + 中画布（右栏已废除）
             mid = ttk.Frame(self.root)
             mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-            # ---- 左栏：素材队列 + 导入 ----
-            left = ttk.Frame(mid, width=240)
-            left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-            left.pack_propagate(False)
+            # ---- 左栏：整体可滚动的竖列（内容未超出高度时自动隐藏滚动条）----
+            self._scroll_visible = True
+            self.left_canvas = tk.Canvas(mid, width=330, bg=THEME["SURFACE"], highlightthickness=0)
+            self.left_scroll = ttk.Scrollbar(mid, orient="vertical", command=self.left_canvas.yview)
+            self.left_canvas.configure(yscrollcommand=self.left_scroll.set)
+            self.left_canvas.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 0))
+            self.left_scroll.pack(side=tk.LEFT, fill=tk.Y)
+            self.left_content = ttk.Frame(self.left_canvas)
+            # 让内容窗口填满画布宽度，消除右侧空白；width 随画布保持一致
+            self._left_win = self.left_canvas.create_window((0, 0), window=self.left_content, anchor="nw", width=330)
 
-            # ---- 导入 / 规范 板块 ----
-            imp = ttk.LabelFrame(left, text="导入 / 规范素材")
-            imp.pack(fill=tk.X, pady=(2, 4))
+            def _sync_left(e=None):
+                self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+                # 内容高度未超出画布时隐藏滚动条，避免多余的「上下滚动条」
+                total = self.left_canvas.bbox("all")
+                vis = bool(total) and (total[3] - total[1]) > self.left_canvas.winfo_height()
+                if vis != self._scroll_visible:
+                    self._scroll_visible = vis
+                    if vis:
+                        self.left_scroll.pack(side=tk.LEFT, fill=tk.Y)
+                    else:
+                        self.left_scroll.pack_forget()
+
+            self.left_content.bind("<Configure>", _sync_left)
+            self.left_canvas.bind("<Configure>", _sync_left)
+            self.left_canvas.bind("<MouseWheel>", lambda e: self.left_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+            # 导入 / 规范
+            imp = ttk.LabelFrame(self.left_content, text="导入 / 规范素材")
+            imp.pack(fill=tk.X, pady=(2, 6))
             ib = ttk.Frame(imp)
             ib.pack(fill=tk.X, padx=4, pady=2)
-            ttk.Button(ib, text="导入文件夹", command=self.import_folder).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
-            ttk.Button(ib, text="导入文件", command=self.import_files).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
-            self.import_status_var = tk.StringVar(value="已导入 0 条素材图")
-            ttk.Label(imp, textvariable=self.import_status_var, anchor="w",
-                      font=("TkDefaultFont", 9)).pack(fill=tk.X, padx=4, pady=(2, 0))
-            self.norm_status_var = tk.StringVar(value="尚未生成规范素材图")
-            ttk.Label(imp, textvariable=self.norm_status_var, anchor="w",
-                      font=("TkDefaultFont", 9)).pack(fill=tk.X, padx=4, pady=(0, 4))
+            ttk.Button(ib, text="导入文件夹", style="Primary.TButton", command=self.import_folder).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+            ttk.Button(ib, text="导入文件", style="Secondary.TButton", command=self.import_files).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
 
-            # ---- 素材队列（仅展示规范素材图/ 内容）----
-            self.queue_title = ttk.Label(left, text="素材队列", anchor="w")
-            self.queue_title.pack(fill=tk.X, pady=(2, 2))
-            self.queue_list = tk.Listbox(left, exportselection=False)
-            self.queue_list.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+            # 素材队列
+            ttk.Label(self.left_content, text="素材队列", anchor="w").pack(fill=tk.X, pady=(2, 3))
+            # 素材队列：Listbox + 专用 Scrollbar（项数 > height 时始终可见）
+            qf = ttk.Frame(self.left_content)
+            qf.pack(fill=tk.X, pady=(0, 3))
+            self.queue_list = tk.Listbox(qf, exportselection=False, height=8)
+            self.queue_sb = ttk.Scrollbar(qf, orient="vertical", command=self.queue_list.yview)
+            self.queue_list.configure(yscrollcommand=self.queue_sb.set)
+            self.queue_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.queue_sb.pack(side=tk.LEFT, fill=tk.Y)
             self.queue_list.bind("<<ListboxSelect>>", self._on_queue_select)
-            # 顺序调整
-            obtn = ttk.Frame(left)
-            obtn.pack(fill=tk.X, pady=1)
-            ttk.Button(obtn, text="↑ 上移", command=self.move_up).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
-            ttk.Button(obtn, text="↓ 下移", command=self.move_down).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=1)
-            ttk.Label(left, text="（可从资源管理器拖拽图片到本窗口导入）", anchor="w",
-                      wraplength=250, font=("TkDefaultFont", 8)).pack(fill=tk.X, pady=(4, 0))
-            # 注册系统拖放（Windows）；非 Windows 静默忽略
-            self._enable_drop_target()
+            obtn = ttk.Frame(self.left_content)
+            obtn.pack(fill=tk.X, pady=2)
+            ttk.Button(obtn, text="↑", style="Secondary.TButton", width=2, command=self.move_up).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+            ttk.Button(obtn, text="↓", style="Secondary.TButton", width=2, command=self.move_down).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
 
-            # ---- 中栏：画布 ----
+            # 预览（固定高度窗口：图 fit/letterbox 进窗口，下方控件不再随图高抖动）
+            ttk.Label(self.left_content, text="预览", anchor="w").pack(fill=tk.X, pady=(6, 2))
+            self.preview_box = tk.Frame(self.left_content, width=300, height=150,
+                                        bg=THEME["BG"], relief="groove", borderwidth=1)
+            self.preview_box.pack(pady=2)
+            self.preview_box.pack_propagate(False)  # 关键：禁止子 Label 撑大父框架 → 预览区高度恒定
+            self.preview = ttk.Label(self.preview_box)
+            self.preview.place(relx=0.5, rely=0.5, anchor="center")  # 图居中 letterbox 显示
+
+            # 夹逼范围（分组标题，无开关）→ 纵横比 / 大档 / 小档 三行
+            ttk.Label(self.left_content, text="夹逼范围", anchor="w", style="Muted.TLabel").pack(fill=tk.X, pady=(6, 2))
+            self._build_ratio_tier_controls()
+
+            # 旋转（单行图标按钮，无中文，仅此行为横排图标）
+            grid = ttk.Frame(self.left_content)
+            grid.pack(fill=tk.X, pady=(8, 3))
+            for i, (glyph, cmd) in enumerate((
+                ("↺", lambda: self.rotate(90)),
+                ("⇋", self.mirror),
+                ("⊙", self.center_box),
+                ("↻", lambda: self.rotate(-90)),
+            )):
+                ttk.Button(grid, text=glyph, style="Secondary.TButton", width=3, command=cmd).grid(row=0, column=i, sticky="nsew", padx=2)
+                grid.columnconfigure(i, weight=1)
+
+            # 格式 / 质量
+            fmt = ttk.Frame(self.left_content)
+            fmt.pack(fill=tk.X, pady=(8, 3))
+            ttk.Label(fmt, text="格式").pack(side=tk.LEFT)
+            ttk.OptionMenu(fmt, self.out_format, "JPEG", "JPEG", "PNG").pack(side=tk.LEFT, padx=2)
+            ttk.Label(fmt, text="质量").pack(side=tk.LEFT, padx=(8, 0))
+            qf = ttk.Frame(fmt)
+            qf.pack(side=tk.LEFT, padx=2)
+            ttk.Button(qf, image=self._arrow_left, style="Stepper.TButton", command=lambda: self._step_quality(-1)).pack(side=tk.LEFT)
+            ttk.Label(qf, textvariable=self.quality, width=3, anchor="center").pack(side=tk.LEFT, padx=2)
+            ttk.Button(qf, image=self._arrow_right, style="Stepper.TButton", command=lambda: self._step_quality(1)).pack(side=tk.LEFT)
+
+            # ---- 运行日志面板（左下角空位）----
+            log_frame = ttk.LabelFrame(self.left_content, text="运行日志")
+            log_frame.pack(fill=tk.X, padx=4, pady=(8, 4))
+            log_row = ttk.Frame(log_frame)
+            log_row.pack(fill=tk.X, padx=3, pady=3)
+            self.log_text = tk.Text(log_row, height=6, wrap="word", state="disabled",
+                                    font=("Consolas", 9), bg=THEME["BG"], fg=THEME["TEXT"],
+                                    relief="flat", borderwidth=1, highlightthickness=0)
+            self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            log_sb = ttk.Scrollbar(log_row, orient="vertical", command=self.log_text.yview)
+            log_sb.pack(side=tk.LEFT, fill=tk.Y)
+            self.log_text.configure(yscrollcommand=log_sb.set)
+            ttk.Button(log_row, text="清空", style="Stepper.TButton",
+                       command=self._clear_log).pack(side=tk.LEFT, padx=(2, 0))
+            # 接管 stdout / stderr → 运行日志面板
+            sys.stdout = _LogRedirector(self.log_text)
+            sys.stderr = _LogRedirector(self.log_text)
+
+            # ---- 中栏：画布（满宽）----
             center = ttk.Frame(mid)
             center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            self.canvas = tk.Canvas(center, bg="#e8e8e8", cursor="cross", takefocus=1,
-                                    highlightthickness=0)
+            self.canvas = tk.Canvas(center, bg="#e8e8e8", cursor="cross", takefocus=1, highlightthickness=0)
             self.canvas.pack(fill=tk.BOTH, expand=True)
             self.canvas.bind("<ButtonPress-1>", self.on_down)
             self.canvas.bind("<B1-Motion>", self.on_drag)
@@ -348,79 +621,16 @@ def main():
             self.canvas.bind("<Configure>", self._on_canvas_configure)
             self._pending_draw = None
 
-            # ---- 右栏：参数 + 放大预览 ----
-            right = ttk.Frame(mid, width=300)
-            right.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
-            right.pack_propagate(False)
-
-            ttk.Label(right, text="结果预览（放大）", anchor="w").pack(fill=tk.X, pady=(4, 0))
-            self.preview = ttk.Label(right)
-            self.preview.pack(pady=2)
-            self.info_var = tk.StringVar(value="—")
-            ttk.Label(right, textvariable=self.info_var, anchor="w", wraplength=280).pack(fill=tk.X)
-
-            self.suite_btn = ttk.Button(right, text="", command=self.toggle_suite)
-            self.suite_btn.pack(fill=tk.X, pady=(8, 2))
-            self._sync_suite_btn()
-
-            ttk.Separator(right).pack(fill=tk.X, pady=4)
-            ttk.Label(right, text="尺寸套装（可编辑）", anchor="w").pack(fill=tk.X)
-            self.tier_entries = {}
-            for k in ("large", "medium", "small"):
-                row = ttk.Frame(right)
-                row.pack(fill=tk.X, pady=1)
-                t = self.cfg["tiers"][k]
-                ttk.Label(row, text=t.get("label", k), width=4).pack(side=tk.LEFT)
-                ew = ttk.Entry(row, width=7)
-                eh = ttk.Entry(row, width=7)
-                ew.insert(0, str(t["w"]))
-                eh.insert(0, str(t["h"]))
-                ew.pack(side=tk.LEFT, padx=2)
-                eh.pack(side=tk.LEFT, padx=2)
-                self.tier_entries[k] = (ew, eh)
-                ttk.Button(row, text=f"用{k}", command=lambda kk=k: self.set_tier(kk)).pack(side=tk.LEFT, padx=2)
-
-            ttk.Separator(right).pack(fill=tk.X, pady=4)
-            ttk.Label(right, text="自定义尺寸（套装关时生效）", anchor="w").pack(fill=tk.X)
-            crow = ttk.Frame(right)
-            crow.pack(fill=tk.X, pady=1)
-            self.cw = ttk.Entry(crow, width=7)
-            self.ch = ttk.Entry(crow, width=7)
-            self.cw.insert(0, "1920")
-            self.ch.insert(0, "1080")
-            self.cw.pack(side=tk.LEFT, padx=2)
-            self.ch.pack(side=tk.LEFT, padx=2)
-            ttk.Button(crow, text="设为框", command=self.apply_custom).pack(side=tk.LEFT, padx=2)
-
-            ttk.Separator(right).pack(fill=tk.X, pady=4)
-            ttk.Button(right, text="↺ 左转90°", command=lambda: self.rotate(90)).pack(fill=tk.X, pady=1)
-            ttk.Button(right, text="↻ 右转90°", command=lambda: self.rotate(-90)).pack(fill=tk.X, pady=1)
-            ttk.Button(right, text="⇋ 镜像", command=self.mirror).pack(fill=tk.X, pady=1)
-            ttk.Button(right, text="居中 (C)", command=self.center_box).pack(fill=tk.X, pady=1)
-
-            fmt = ttk.Frame(right)
-            fmt.pack(fill=tk.X, pady=(6, 0))
-            ttk.Label(fmt, text="格式").pack(side=tk.LEFT)
-            ttk.OptionMenu(fmt, self.out_format, "JPEG", "JPEG", "PNG").pack(side=tk.LEFT, padx=2)
-            ttk.Label(fmt, text="质量").pack(side=tk.LEFT, padx=(6, 0))
-            ttk.Spinbox(fmt, from_=10, to=100, textvariable=self.quality, width=5).pack(side=tk.LEFT, padx=2)
-
-            ttk.Label(right, text="快捷键：空格 确认 · C 居中 · 1 返工 · 3 精修",
-                      anchor="w", wraplength=280).pack(fill=tk.X, pady=(10, 0))
-
-            # 底部状态栏 + 操作按钮
+            # 底部：薄状态栏（无数字计数）
             bottom = ttk.Frame(self.root)
             bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
-            ttk.Button(bottom, text="确认裁剪 (空格)", command=self.confirm_crop).pack(side=tk.LEFT, padx=2)
-            ttk.Button(bottom, text="返工 (1)", command=self.rework_prev).pack(side=tk.LEFT, padx=2)
-            ttk.Button(bottom, text="精修 (3)", command=self.retouch_prev).pack(side=tk.LEFT, padx=2)
             self.progress = ttk.Label(bottom, textvariable=self.progress_var, anchor="w")
             self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
         # ---------------- 导入 ----------------
         def _update_import_status(self):
-            n = len(self.source_paths)
-            self.import_status_var.set(f"已导入 {n} 条素材图")
+            """常驻计数已废弃：此调用保留为 no-op，避免改动多处调用点。"""
+            return
 
         def import_folder(self):
             d = filedialog.askdirectory(title="选择源图片文件夹")
@@ -439,64 +649,6 @@ def main():
                 self.progress_var.set(f"已导入文件：{len(self.source_paths)} 张。点「规范素材尺寸」生成规范素材图。")
             if not self.queue:
                 self._show_import_preview()
-        def _enable_drop_target(self):
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                WM_DROPFILES = 0x0233
-                GWL_WNDPROC = -4
-                user32 = ctypes.windll.user32
-                shell32 = ctypes.windll.shell32
-
-                # 明确 64 位兼容的类型
-                user32.SetWindowLongPtrW.restype = wintypes.LONG_PTR
-                user32.SetWindowLongPtrW.argtypes = [
-                    wintypes.HWND, ctypes.c_int, wintypes.LONG_PTR]
-
-                WNDPROC = ctypes.WINFUNCTYPE(
-                    wintypes.LRESULT,
-                    wintypes.HWND,
-                    wintypes.UINT,
-                    wintypes.WPARAM,
-                    wintypes.LPARAM)
-
-                def hook(hwnd, msg, wparam, lparam):
-                    if msg == WM_DROPFILES:
-                        hdrop = wintypes.HANDLE(wparam)
-                        n = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-                        files = []
-                        for i in range(n):
-                            buf = ctypes.create_unicode_buffer(1024)
-                            shell32.DragQueryFileW(hdrop, i, buf, 1024)
-                            files.append(buf.value)
-                        shell32.DragFinish(hdrop)
-                        self.root.after(0, lambda: self._on_drop(files))
-                        return 0
-                    return self._old_call(hwnd, msg, wparam, lparam)
-
-                self._drop_hook = WNDPROC(hook)
-                hwnd = self.root.winfo_id()
-                self._old_winproc = user32.SetWindowLongPtrW(
-                    hwnd, GWL_WNDPROC, self._drop_hook)
-                # 把旧 wndproc 地址转成可调用对象，避免 ctypes 把裸 int 当 32 位传
-                self._old_call = WNDPROC(self._old_winproc)
-                shell32.DragAcceptFiles(hwnd, True)
-            except Exception:
-                pass  # 非 Windows 或不支持则静默忽略，仍可用导入按钮
-
-        def _on_drop(self, files):
-            imgs = [f for f in files if is_image(f)]
-            if not imgs:
-                return
-            self.source_paths = list(self.source_paths) + imgs  # 追加导入
-            self._update_import_status()
-            self.progress_var.set(
-                f"已拖入 {len(imgs)} 张，导入队列共 {len(self.source_paths)} 张；点击「规范素材尺寸」生成规范素材图。")
-            if not self.queue:
-                self._show_import_preview()
-
-        # ---------------- 顺序调整 ----------------
         def move_up(self):
             self._reorder(-1)
 
@@ -560,10 +712,11 @@ def main():
                     ok, skip = process_step1(
                         sources, self.dirs["spec"],
                         quality=self.quality.get(), on_progress=cb,
-                        min_width=self.cfg["tiers"]["small"]["w"])
-                    mw = self.cfg["tiers"]["small"]["w"]
+                        tiers=self.cfg["tiers"])
+                    lw = self.cfg["tiers"]["large"]
                     self.root.after(0, lambda: self.progress_var.set(
-                        f"规范素材尺寸完成：成功 {ok}，跳过 {skip}；宽度不足 {mw} 的已按比例放大，原比例不变"))
+                        f"规范素材尺寸完成：成功 {ok}，跳过 {skip}；"
+                        f"按 large 档 {lw['w']}x{lw['h']} 覆盖缩放（一边贴边、溢出供取景），原比例不变"))
                 except Exception as e:
                     self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
                 finally:
@@ -576,25 +729,23 @@ def main():
             # 这批导入源已处理为规范素材图，清空导入列表并刷新状态
             self.source_paths = []
             self._update_import_status()
-            self.norm_status_var.set("规范素材图已生成，可在下方素材队列裁剪")
             self._refresh_queue()
             self.idx = 0
             self._load_current()
 
         # ---------------- 队列 / 刷新 ----------------
         def _refresh_queue(self):
-            done = set(os.listdir(self.dirs["out"])) if os.path.isdir(self.dirs["out"]) else set()
+            # 队列显示规范素材图下所有图片（包括已导出过的），方便随时回头取景再裁。
+            # （原版排除 out/ 已导出项，结果全部已裁完后队列变空、画布卡灰，用户体验差）
             files = list_source_images(self.dirs["spec"])
-            # 排除 返工 子文件夹（list_source_images 只列顶层，已天然排除）
-            self.queue = [f for f in files if f not in done]
+            self.queue = list(files)
             self._fill_listbox()
 
         def _fill_listbox(self):
             if not hasattr(self, "queue_list"):
                 return
             self.queue_list.delete(0, tk.END)
-            total = len(list_source_images(self.dirs["spec"]))
-            self.queue_title.configure(text=f"素材队列（待裁剪 {len(self.queue)} / 共 {total}）")
+            self._update_import_status()  # 刷新单行状态（队列 X/Y）
             for f in self.queue:
                 self.queue_list.insert(tk.END, f)
 
@@ -607,6 +758,15 @@ def main():
                 return
             self.idx = i
             self._load_current()
+
+        def _clear_log(self):
+            """清空运行日志面板。"""
+            try:
+                self.log_text.configure(state="normal")
+                self.log_text.delete("1.0", tk.END)
+                self.log_text.configure(state="disabled")
+            except Exception:
+                pass
 
         def _focus_rescan(self):
             prev_name = self.img_name
@@ -640,10 +800,11 @@ def main():
                 messagebox.showerror("无法打开", f"{name}\n{e}")
                 return
             self.img_name = name
-            self.manual_tier = None
             self._place_box_default()
             self._draw()
             self._render_preview()
+            # 布局可能尚未完成（如 step1 后台线程刚回主线程），延迟再重绘一次确保画布不卡灰色
+            self.root.after(40, self._draw)
             self.info_var.set(f"[{self.idx+1}/{len(self.queue)}] {name}  {self.img.size[0]}×{self.img.size[1]}")
             # 同步队列列表高亮
             if hasattr(self, "queue_list"):
@@ -667,7 +828,6 @@ def main():
                 messagebox.showerror("无法打开", f"{name}\n{e}")
                 return
             self.img_name = name
-            self.manual_tier = None
             self._place_box_default()
             self._draw()
             self._render_preview()
@@ -675,23 +835,21 @@ def main():
                 f"导入预览 {name}  {self.img.size[0]}×{self.img.size[1]}  —— 点「规范素材尺寸」生成规范素材图后再裁剪")
 
         def _current_box_size(self):
-            if self.cfg["suite_on"]:
-                if self.manual_tier:
-                    t = self.cfg["tiers"][self.manual_tier]
-                else:
-                    t = self.cfg["tiers"][pick_tier_auto(*self.img.size, self.cfg["tiers"])]
-                return t["w"], t["h"]
-            else:
-                try:
-                    return max(1, int(self.cw.get())), max(1, int(self.ch.get()))
-                except ValueError:
-                    return 1920, 1080
+            """当前生效档（大档/小档，手动单选）的裁剪框尺寸。"""
+            t = self.cfg["tiers"][self.active_tier]
+            return t["w"], t["h"]
 
         def _place_box_default(self):
+            if self.img is None:
+                return
             bw, bh = self._current_box_size()
-            self.box, self.last_anchor = anchor_to_box(
-                self.last_anchor[0], self.last_anchor[1],
-                self.img.size[0], self.img.size[1], bw, bh)
+            iw, ih = self.img.size
+            # 先按锚点放置（默认居中）；素材比档位小时，夹为图像内「贴边的夹逼框」
+            # （与图像同比例、居中内接），避免裁剪框超出图片范围
+            box, anchor = anchor_to_box(
+                self.last_anchor[0], self.last_anchor[1], iw, ih, bw, bh)
+            box = self._clamp_box(box, iw, ih)
+            self.box, self.last_anchor = box, anchor
 
         def _on_canvas_configure(self, event=None):
             """画布尺寸变化时防抖重绘，让 fit-to-window 始终填满可用空间。"""
@@ -703,12 +861,28 @@ def main():
             self._pending_draw = None
             if self.img is None:
                 self._clear_canvas()
+                # 空态提示：让「空」变成「在等导入」，而非「坏没坏」
+                try:
+                    cw = self.canvas.winfo_width() or 800
+                    ch = self.canvas.winfo_height() or 600
+                    if cw > 2 and ch > 2:
+                        self.canvas.create_text(cw // 2, ch // 2,
+                                                text="导入图片后在此裁剪 · 或从资源管理器拖入",
+                                                fill=THEME["HINT"], font=("Segoe UI", 13), tag="hint")
+                except Exception:
+                    pass
                 return
             cw = self.canvas.winfo_width() or 800
             ch = self.canvas.winfo_height() or 600
             iw, ih = self.img.size
             self.fit_scale = min(cw / iw, ch / ih, 1.0) if (iw and ih) else 1.0
             dw, dh = int(iw * self.fit_scale), int(ih * self.fit_scale)
+            if dw < 1 or dh < 1:
+                # 画布尚未完成布局（窗口未映射/被遮挡时 winfo 尺寸为 0/1），
+                # 此时无法正确缩放；延迟重试，待布局完成后再真实重绘，
+                # 既避免 PIL resize 收到 0 尺寸抛 ValueError，也避免画布卡在灰色
+                self.root.after(80, self._draw)
+                return
             self.offx = (cw - dw) // 2
             self.offy = (ch - dh) // 2
             disp = self.img.resize((dw, dh), _RESAMPLE)
@@ -720,6 +894,7 @@ def main():
             y0 = self.offy + self.box[1] * self.fit_scale
             x1 = self.offx + self.box[2] * self.fit_scale
             y1 = self.offy + self.box[3] * self.fit_scale
+            self._kuang_underlay(x0, y0, x1, y1)  # THEME_ON 时底层金边外框
             self.canvas.create_rectangle(x0, y0, x1, y1, outline="#ff3b30", width=2, tag="ui")
             for fx in (1/3, 2/3):
                 self.canvas.create_line(x0 + (x1-x0)*fx, y0, x0 + (x1-x0)*fx, y1, fill="#ff3b30", width=1, dash=(4, 3), tag="ui")
@@ -739,11 +914,8 @@ def main():
                 return
             bw, bh = self._current_box_size()
             fx, fy = self._box_anchor()
-            if self.cfg["suite_on"]:
-                out = crop_for_tier(self.img, bw, bh, fx, fy)
-            else:
-                out = crop_free(self.img, self.box)
-            pw, ph = 280, 158
+            out = crop_for_tier(self.img, bw, bh, fx, fy)
+            pw, ph = 290, 140   # 匹配预览窗口内尺寸（300x150 减去描边），恒定不变
             out.thumbnail((pw, ph), _RESAMPLE)
             self.preview_tk = ImageTk.PhotoImage(out)
             self.preview.configure(image=self.preview_tk)
@@ -824,13 +996,21 @@ def main():
         def _clamp_box(self, box, iw, ih):
             x0, y0, x1, y1 = box
             w, h = x1 - x0, y1 - y0
-            if w > iw:
-                w = iw
-            if h > ih:
-                h = ih
+            if w <= 0 or h <= 0:
+                return (0, 0, 0, 0)
+            # 严格保持固定比例：框超过图像时任选「内接」方式等比缩小，
+            # 绝不分别夹宽高（否则会破坏 16:9 比例、变成覆盖全图的非 16:9 框）
+            if w > iw or h > ih:
+                s = min(iw / w, ih / h)          # 缩小到恰好内接于图像
+                # 框比图还大时，用户意图是「拉到最大」；居中内接为图内最大 16:9 框，
+                # 不再沿用原框中心（否则会贴边、出现亚像素偏移），保证拖到最大即规整覆盖全图
+                cx, cy = iw / 2.0, ih / 2.0
+                w, h = w * s, h * s
+                x0, y0 = cx - w / 2.0, cy - h / 2.0
+                x1, y1 = cx + w / 2.0, cy + h / 2.0
             x0 = max(0, min(x0, iw - w))
             y0 = max(0, min(y0, ih - h))
-            return (int(x0), int(y0), int(x0 + w), int(y0 + h))
+            return (int(round(x0)), int(round(y0)), int(round(x0 + w)), int(round(y0 + h)))
 
         # ---------------- 操作 ----------------
         def center_box(self):
@@ -867,10 +1047,7 @@ def main():
                 return
             bw, bh = self._current_box_size()
             fx, fy = self._box_anchor()
-            if self.cfg["suite_on"]:
-                out = crop_for_tier(self.img, bw, bh, fx, fy)
-            else:
-                out = crop_free(self.img, self.box)
+            out = crop_for_tier(self.img, bw, bh, fx, fy)
             base = os.path.splitext(self.img_name)[0]
             fmt = self.out_format.get()
             if fmt == "PNG":
@@ -923,45 +1100,180 @@ def main():
             except Exception as e:
                 messagebox.showerror("精修失败", str(e))
 
-        # ---------------- 套装 / 预设 ----------------
-        def toggle_suite(self):
-            self.cfg["suite_on"] = not self.cfg["suite_on"]
-            self._sync_suite_btn()
-            self._save_cfg()
-            if self.img is not None:
-                self._place_box_default()
-                self._draw()
-                self._render_preview()
+        # ---------------- 纵横比 / 档位（夹逼范围）----------------
+        def _build_ratio_tier_controls(self):
+            lc = self.left_content
+            # 纵横比（行首开关 + 宽:高 步进）
+            rrow = ttk.Frame(lc)
+            rrow.pack(fill=tk.X, pady=3)
+            self.ratio_btn = self._make_header_btn(rrow, "纵横比", self.toggle_ratio_lock, self._is_ratio_on)
+            self.ratio_btn.pack(side=tk.LEFT)
+            self._ratio_steppers = ttk.Frame(rrow)
+            self._ratio_steppers.pack(side=tk.LEFT, padx=(4, 0))
+            wf = self._make_stepper(self._ratio_steppers, self.ratio_w, 1, 3, self._on_ratio_changed)
+            wf.pack(side=tk.LEFT)
+            ttk.Label(self._ratio_steppers, text=":").pack(side=tk.LEFT, padx=1)
+            hf = self._make_stepper(self._ratio_steppers, self.ratio_h, 1, 3, self._on_ratio_changed)
+            hf.pack(side=tk.LEFT)
+            self.ratio_entries = [wf._entry, hf._entry]
 
-        def _sync_suite_btn(self):
-            self.suite_btn.configure(text="● 套装：开（自动选档）" if self.cfg["suite_on"] else "○ 套装：关（自由自定义）")
+            # 大档 / 小档（行首单选 + 宽×高 步进）
+            self.tier_vars = {}
+            self.tier_btns = {}
+            self.tier_h_entries = {}
+            for key in ("large", "small"):
+                t = self.cfg["tiers"][key]
+                row = ttk.Frame(lc)
+                row.pack(fill=tk.X, pady=3)
+                btn = self._make_header_btn(row, t["label"], lambda k=key: self._set_tier_active(k), lambda k=key: self.active_tier == k)
+                btn.pack(side=tk.LEFT)
+                self.tier_btns[key] = btn
+                svars = {}
+                wf = self._make_stepper(row, tk.IntVar(value=t["w"]), 1, 4, (lambda k=key: self._on_tier_changed(k, "w")))
+                wf.pack(side=tk.LEFT, padx=(4, 0))
+                svars["w"] = wf._var
+                ttk.Label(row, text="×").pack(side=tk.LEFT, padx=1)
+                hf = self._make_stepper(row, tk.IntVar(value=t["h"]), 1, 4, (lambda k=key: self._on_tier_changed(k, "h")))
+                hf.pack(side=tk.LEFT, padx=(1, 0))
+                svars["h"] = hf._var
+                self.tier_vars[key] = svars
+                self.tier_h_entries[key] = hf._entry
+            self._refresh_headers()
 
-        def set_tier(self, key):
-            self.manual_tier = key
-            self._save_cfg()
-            if self.img is not None:
-                self._place_box_default()
-                self._draw()
-                self._render_preview()
+        def _make_header_btn(self, parent, text, command, state_getter):
+            """行首开关按钮：点击切换状态（纵横比=开/关，档位=选中/未选）。"""
+            b = ttk.Button(parent, text=text, style="Secondary.TButton", command=command)
+            b._base = text
+            b._state_getter = state_getter
+            return b
 
-        def apply_custom(self):
+        def _is_ratio_on(self):
+            return self.ratio_lock
+
+        def _make_stepper(self, parent, var, step, width, on_step=None):
+            """[-][Entry][+] 步进器：单次 ±step，可连点；Entry 可手填。"""
+            f = ttk.Frame(parent)
+            f._var = var
+            ttk.Button(f, image=self._arrow_left, style="Stepper.TButton",
+                       command=lambda: self._step_var(var, -step, on_step)).pack(side=tk.LEFT)
+            e = ttk.Entry(f, textvariable=var, width=width, justify="center")
+            e.pack(side=tk.LEFT, padx=1)
+            ttk.Button(f, image=self._arrow_right, style="Stepper.TButton",
+                       command=lambda: self._step_var(var, step, on_step)).pack(side=tk.LEFT)
+            f._entry = e
+            if on_step:
+                e.bind("<KeyRelease>", lambda ev: on_step())
+                e.bind("<FocusOut>", lambda ev: on_step())
+            return f
+
+        def _step_var(self, var, delta, on_step):
             try:
-                self.custom = {"w": int(self.cw.get()), "h": int(self.ch.get())}
-            except ValueError:
+                v = max(1, int(var.get()) + delta)
+                var.set(v)
+            except Exception:
                 pass
+            if on_step:
+                on_step()
+
+        def _step_quality(self, d):
+            self.quality.set(max(10, min(100, self.quality.get() + d)))
+
+        def _on_ratio_changed(self):
+            """纵横比 宽:高 改变 → 以宽为准，两档 h = round(w/ratio) 保持同比例。"""
+            try:
+                rw = max(1, int(self.ratio_w.get()))
+                rh = max(1, int(self.ratio_h.get()))
+            except Exception:
+                return
+            ratio = rw / rh
+            for k in ("large", "small"):
+                w = int(self.tier_vars[k]["w"].get())
+                h = max(1, round(w / ratio))
+                self.tier_vars[k]["h"].set(h)
+                self.cfg["tiers"][k]["w"] = w
+                self.cfg["tiers"][k]["h"] = h
+            self.cfg["ratio"] = [rw, rh]
             self._save_cfg()
-            if not self.cfg["suite_on"] and self.img is not None:
+            if self.img is None:
+                return
+            self._place_box_default()
+            self._draw()
+            self._render_preview()
+
+        def _on_tier_changed(self, key, dim):
+            """某档宽或高被改：写回配置；锁定时改宽联动 h；当前档实时刷新裁剪框。"""
+            try:
+                v = max(1, int(self.tier_vars[key][dim].get()))
+            except Exception:
+                return
+            self.cfg["tiers"][key][dim] = v
+            if self.ratio_lock and dim == "w":
+                ratio = int(self.ratio_w.get()) / max(1, int(self.ratio_h.get()))
+                h = max(1, round(v / ratio))
+                self.tier_vars[key]["h"].set(h)
+                self.cfg["tiers"][key]["h"] = h
+            self._save_cfg()
+            if key == self.active_tier and self.img is not None:
                 self._place_box_default()
                 self._draw()
                 self._render_preview()
+
+        def _set_tier_active(self, key):
+            """单选生效档：点大档/小档之一即生效，裁剪框立即用该档尺寸。"""
+            if key not in self.cfg["tiers"]:
+                return
+            self.active_tier = key
+            self._save_cfg()
+            self._refresh_headers()
+            if self.img is not None:
+                self._place_box_default()
+                self._draw()
+                self._render_preview()
+
+        def toggle_ratio_lock(self):
+            """纵横比开关：开→按 ratio 对齐两档 h；关→保持当前数值不动。"""
+            self.ratio_lock = not self.ratio_lock
+            self._save_cfg()
+            self._refresh_headers()
+            if self.ratio_lock:
+                self._on_ratio_changed()
+            else:
+                if self.img is not None:
+                    self._place_box_default()
+                    self._draw()
+                    self._render_preview()
+
+        def _style_header(self, btn, on):
+            try:
+                btn.configure(style="Primary.TButton" if on else "Secondary.TButton",
+                              text=("● " + btn._base) if on else btn._base)
+            except Exception:
+                pass
+
+        def _refresh_headers(self):
+            """刷新三个行首按钮视觉态；锁定时禁用 h 输入框与纵横比输入框。"""
+            self._style_header(self.ratio_btn, self.ratio_lock)
+            for e in self.ratio_entries:
+                try:
+                    e.configure(state="disabled" if not self.ratio_lock else "normal")
+                except Exception:
+                    pass
+            for key, btn in self.tier_btns.items():
+                self._style_header(btn, self.active_tier == key)
+                try:
+                    self.tier_h_entries[key].configure(state="disabled" if self.ratio_lock else "normal")
+                except Exception:
+                    pass
 
         def _save_cfg(self):
-            # 同步三档编辑框到 config
-            for k, (ew, eh) in self.tier_entries.items():
+            self.cfg["active_tier"] = self.active_tier
+            self.cfg["ratio_lock"] = self.ratio_lock
+            self.cfg["ratio"] = [int(self.ratio_w.get()), int(self.ratio_h.get())]
+            for k in ("large", "small"):
                 try:
-                    self.cfg["tiers"][k]["w"] = int(ew.get())
-                    self.cfg["tiers"][k]["h"] = int(eh.get())
-                except ValueError:
+                    self.cfg["tiers"][k]["w"] = int(self.tier_vars[k]["w"].get())
+                    self.cfg["tiers"][k]["h"] = int(self.tier_vars[k]["h"].get())
+                except Exception:
                     pass
             save_config(self.config_path, self.cfg)
 
@@ -977,4 +1289,35 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # 启动异常不再「闪退」：写 crash.log 并弹出可读错误，便于定位
+        import traceback as _tb, os as _os
+        try:
+            _log = _os.path.join(
+                _os.path.dirname(_os.path.abspath(sys.argv[0] or ".")), "crash.log")
+            with open(_log, "w", encoding="utf-8") as _f:
+                _tb.print_exc(file=_f)
+        except Exception:
+            _log = None
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            _mb.showerror("启动失败", "启动失败，详见同目录 crash.log"
+                          + (f"：\n{_log}" if _log else ""))
+        except Exception:
+            # tkinter 也不可用（运行环境缺 tkinter）→ 用 ctypes 弹系统消息框
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "启动失败：运行环境缺少 tkinter（请用带 tkinter 的 Python 运行，或打包为 exe）。\n详见同目录 crash.log",
+                    "启动失败", 0x10)
+            except Exception:
+                pass
+        # 防止控制台一闪而过：等待回车（从控制台启动时有效；双击无控制台则忽略）
+        try:
+            input("按回车退出…")
+        except Exception:
+            pass

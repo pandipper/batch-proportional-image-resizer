@@ -11,3 +11,6 @@ adaptive_output/
 测试素材/
 config.json
 
+# 参考 UI 素材（仅本地参考，不进仓库）
+供参考的ui/
+
