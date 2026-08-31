@@ -118,7 +118,7 @@ THEME = {
 
 # 仅保留亮色主题（暗色主题已废弃）。可选 4 个主题：1 个默认 + 3 个 ttkbootstrap 内置官方主题。
 APP_TITLE = "批量图片等比例缩放工具"
-APP_VERSION = "1.0.0"          # 显示在窗口标题，用于发布后可追溯版本
+APP_VERSION = "1.0.1"          # 显示在窗口标题，用于发布后可追溯版本
 THEME_CHOICES = ["minty", "everforest-light", "tokyo-night-light", "solarized-light"]
 
 # 全站字体：注册成功后 Tk 按此名取用；注册失败则回退系统字体（见 _register_fonts）
