@@ -18,7 +18,7 @@ adaptive_image_resizer.py — 等比例批量缩放（不裁剪 / 不拉伸 / �
 
 用法:
     python adaptive_image_resizer.py --input <图片目录> [--output <输出目录>]
-                                     [--quality 92] [--sort] [--recursive]
+                                     [--quality 100] [--sort] [--recursive]
 
 示例:
     python adaptive_image_resizer.py --input ./photos --sort
@@ -120,7 +120,7 @@ def main():
     ap = argparse.ArgumentParser(description="等比例批量缩放（自适应分档，不裁剪）")
     ap.add_argument("--input", required=True, help="图片所在目录")
     ap.add_argument("--output", default=None, help="输出目录（默认 <input>/adaptive_output）")
-    ap.add_argument("--quality", type=int, default=92, help="JPG/WEBP 质量 1-100，默认 92")
+    ap.add_argument("--quality", type=int, default=100, help="JPG/WEBP 质量 1-100，默认 100（与 GUI 版一致，无损优先）")
     ap.add_argument("--sort", action="store_true", help="按 large/medium/small/kept 分目录")
     ap.add_argument("--recursive", action="store_true", help="递归处理子目录")
     args = ap.parse_args()

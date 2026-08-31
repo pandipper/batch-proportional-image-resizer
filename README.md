@@ -1,6 +1,6 @@
 # 批量图片等比例缩放工具 · Batch Proportional Image Resizer
 
-![Version](https://img.shields.io/badge/version-1.0.1-blue)
+![Version](https://img.shields.io/badge/version-1.0.2-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.12%2B-green)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -181,7 +181,7 @@ pyinstaller build_exe.spec --noconfirm     # Windows 下也可直接双击 build
 ```bash
 python adaptive_image_resizer.py --input <图片目录> --sort
 #   --output <目录>     指定输出目录（默认在原目录旁生成 adaptive_output/）
-#   --quality 92        输出质量（默认 92）
+#   --quality 100       输出质量 1-100（默认 100，与 GUI 版一致，无损优先）
 #   --recursive         递归处理子目录
 #   --sort              按 large/medium/small/kept 分子目录
 ```

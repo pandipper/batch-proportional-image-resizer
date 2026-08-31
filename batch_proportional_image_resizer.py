@@ -1,3 +1,14 @@
+#!/usr/bin/python3.12
+# ↑ shebang 是给 Windows 的 Python Launcher（py.exe）看的。双击 .py 时
+#   Windows 走的是 py.exe，而 py.exe 的「默认版本」未必是你装依赖的那个
+#   Python——实测本机 py.exe 默认指向 3.14，而 3.14 的解释器早已被卸载
+#   （C:\Users\...\AppData\Local\Python\pythoncore-3.14-64 不存在），
+#   于是 py.exe 直接报 "Unable to create process" 后退出，表现为双击闪退。
+#   写上这一行，py.exe 就会改用 3.12（依赖都装在这里）。
+#   注意别写成 #!/usr/bin/env python3.12 —— 那种写法走 PATH 查找，
+#   本机 PATH 里 3.12 排在 uv 的 3.12.13 之后，会命中没装依赖的那个。
+#   PyInstaller 打包时这一行只是注释，不影响 exe。
+
 # MIT License
 # Copyright (c) 2026 pandipper
 #
@@ -12,9 +23,9 @@
 #   修改后成图/精修/      —— 3 键搬运「上一张」的结果
 
 # ───── 双击 .py 闪退兜底 ─────
-# Windows 把 .py 关联到任意已安装 Python（常是损坏的 3.13），导致缺包崩溃
-# 而控制台一闪而过看不到错误。这里捕获所有未处理异常，弹窗告知用户用
-# run_gui.bat 或安装依赖；同时捕获 ImportError 给出明确指引。
+# 双击启动时 Windows 用的是控制台 python.exe，一旦中途抛异常，控制台会
+# 在你看清之前就关掉（表现为「闪退」）。这里捕获所有未处理异常，改成弹窗
+# 把错误留下来；同时单独捕获 ImportError，给出「装依赖 / 换解释器」的指引。
 from __future__ import annotations
 
 import os
@@ -46,13 +57,15 @@ except ImportError as _e:
     _show_error(
         "缺少依赖库",
         f"当前 Python 解释器缺少：{_e.name}\n\n"
-        "这通常是因为双击 .py 时 Windows 把 .py 关联到了一个"
-        "没有安装 ttkbootstrap / customtkinter / pillow 的 Python。\n\n"
+        f"正在使用的解释器：\n  {sys.executable}\n\n"
+        "双击 .py 时 Windows 会交给 py.exe（Python Launcher）挑一个版本，\n"
+        "它挑中的那个未必装了本工具的依赖。\n\n"
         "解决方法（任选其一）：\n"
-        "  ① 双击 run_gui.bat 启动（已指定 Python 3.12）\n"
-        "  ② 在正确的 Python 里安装依赖：\n"
-        "     C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\python.exe "
-        "-m pip install ttkbootstrap customtkinter pillow",
+        "  ① 双击 run_gui.bat 启动（显式指定 Python 3.12）\n"
+        "  ② 给当前解释器补装依赖：\n"
+        f'     "{sys.executable}" -m pip install ttkbootstrap customtkinter pillow\n'
+        "  ③ 若上面报的是 3.14/3.13 之类你没装过的版本，说明 py.exe 的默认\n"
+        "     版本指向了一个已卸载的解释器，改用 run_gui.bat 即可绕开。",
     )
     sys.exit(1)
 
@@ -118,7 +131,7 @@ THEME = {
 
 # 仅保留亮色主题（暗色主题已废弃）。可选 4 个主题：1 个默认 + 3 个 ttkbootstrap 内置官方主题。
 APP_TITLE = "批量图片等比例缩放工具"
-APP_VERSION = "1.0.1"          # 显示在窗口标题，用于发布后可追溯版本
+APP_VERSION = "1.0.2"          # 显示在窗口标题，用于发布后可追溯版本
 THEME_CHOICES = ["minty", "everforest-light", "tokyo-night-light", "solarized-light"]
 
 # 全站字体：注册成功后 Tk 按此名取用；注册失败则回退系统字体（见 _register_fonts）
@@ -239,6 +252,18 @@ class _LogRedirector:
 
 def is_image(name: str) -> bool:
     return name.lower().endswith(IMG_EXTS)
+
+
+def _open_rgb(path: str) -> "Image.Image":
+    """以 RGB 模式打开任意图片，返回 PIL Image（调用方负责持有）。
+
+    抽成模块级函数是为了避免在 App 方法里直接引用 ``Image.open`` 时，
+    因闭包解析问题偶发 ``free variable 'Image'`` 异常（用户 v1.0.1 实测遇到过）。
+    模块级 import 的 ``Image`` 是明确的全局，不会被内部作用域阴影。
+    """
+    from PIL import Image  # 冗余但防御性：即使模块级 import 被干扰也能工作
+    with Image.open(path) as im:
+        return im.convert("RGB")
 
 
 # ---------- 主题 / 字体：从 App._apply_theme 抽出的可单测纯逻辑 ----------
@@ -429,12 +454,11 @@ def process_step1(source_paths: Sequence[str], out_dir: str, quality: int = 100,
             skip += 1
             continue
         try:
-            with Image.open(src) as im:
-                im = im.convert("RGB")
-                tgt = step1_target_size(*im.size, tiers=tiers, min_width=min_width)
-                out = im.resize(tgt, _RESAMPLE)
-                base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
-                out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
+            im = _open_rgb(src)
+            tgt = step1_target_size(*im.size, tiers=tiers, min_width=min_width)
+            out = im.resize(tgt, _RESAMPLE)
+            base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
+            out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
             ok += 1
         except Exception as e:
             skip += 1
@@ -660,6 +684,56 @@ def main():
         frame.rowconfigure(0, weight=1)
         _CTK_REGISTRY.append(("group", frame, bootstyle, items, icon_size, cells))
         return frame
+
+    from ttkbootstrap.dialogs.message import MessageDialog
+
+    class _RichLine:
+        __slots__ = ("text", "style", "indent", "pady")
+        def __init__(self, text="", style=None, indent=0, pady=None):
+            self.text = text
+            self.style = style
+            self.indent = indent
+            self.pady = pady
+
+    class _RichMessageDialog(MessageDialog):
+        """ttkbootstrap MessageDialog 的富文本变体。
+
+        正文拆成多行，每行可独立指定 ``bootstyle``（primary / success / warning /
+        danger / info / secondary / dark），从而把「短边下限 720」「上限 1440」
+        这类对用户最重要的变化值用醒目颜色标出来。图标、按钮、居中、模态、
+        Esc 关闭等行为完全继承自官方 MessageDialog， visually 与原生
+        Messagebox 保持一致。
+        """
+        def __init__(self, lines, title=" ", buttons=None, parent=None,
+                     alert=False, default=None, icon=None, **kwargs):
+            self._lines = lines
+            # 富文本由调用方自己控制换行，message 留空，不再走父类的 textwrap
+            super().__init__(message="", title=title, buttons=buttons or ["OK:primary"],
+                             parent=parent, alert=alert, default=default, icon=icon,
+                             width=1, **kwargs)
+
+        def create_body(self, master):
+            from ttkbootstrap.dialogs.message import _alert_icon
+            container = ttk.Frame(master, padding=self._padding)
+            if self._icon:
+                icon_lbl = self._create_icon_label(container)
+                if icon_lbl is not None:
+                    icon_lbl.pack(side="left", anchor="center", padx=(0, 10))
+            msg_frame = ttk.Frame(container)
+            for line in self._lines:
+                if line.text == "" or line.text is None:
+                    ttk.Frame(msg_frame, height=8).pack(fill="x")
+                    continue
+                kw = {}
+                if line.style:
+                    kw["bootstyle"] = line.style
+                pady = line.pady if line.pady is not None else (0, 3)
+                # 约 8px/字符，60 字符对应 480px；超出自动折行
+                ttk.Label(msg_frame, text=line.text, anchor="w", justify="left",
+                          wraplength=480, **kw).pack(
+                    fill="x", anchor="n", pady=pady, padx=(line.indent, 0))
+            msg_frame.pack(side="left", fill="x", expand=True, anchor="center")
+            container.pack(fill="x", expand=True)
 
     class App:
         def __init__(self, root):
@@ -1117,9 +1191,11 @@ def main():
             self.canvas.bind("<Configure>", self._on_canvas_configure)
             self._pending_draw = None
 
-            # 底部：薄状态栏（无数字计数），与根背景同色，不留硬白边
-            # 最左 = 署名 @pandipper（点击切主题，颜色跟随 PRIMARY）；左 = 操作结果（progress_var）；
-            # 右 = 当前图/队列状态（info_var）
+            # 底部：薄状态栏，与根背景同色，不留硬白边
+            # 左下角（progress_var）= 操作结果文案（导入完成、导出成功、错误提示等）
+            # 右下角（info_var）   = 计数主导的当前状态：
+            #                        step1 阶段显示「已导入 N 张 · 请点击规范素材尺寸」
+            #                        step2 阶段显示「[x/N] 文件名 宽×高」
             bottom = ttk.Frame(self.root)
             bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
             # 署名：点击切换主题，文字色在 _apply_ctk_visuals 里跟随当前 PRIMARY 重染
@@ -1269,14 +1345,26 @@ def main():
                                    localize=False, width=64)
             return ans == "是"
 
+        def _msg_yesno_rich(self, title: str, lines) -> bool:
+            """富文本确认框：每行可独立 bootstyle 颜色。返回 True = 用户点「是"。"""
+            from ttkbootstrap.dialogs.message import _alert_icon
+            dialog = _RichMessageDialog(
+                lines=lines, title=title, parent=self.root,
+                buttons=["否:secondary", "是:primary"],
+                icon=_alert_icon("question"), alert=False, localize=False)
+            dialog.show()
+            return dialog.result == "是"
+
         # ---------------- 导入 ----------------
         def import_folder(self):
             d = filedialog.askdirectory(title="选择源图片文件夹")
             if d:
                 self.source_paths = [os.path.join(d, n) for n in list_source_images(d)]
-                self.progress_var.set(
+                # 右下角 = 计数/当前状态；左下角 = 操作结果
+                self.info_var.set(
                     f"已导入 {len(self.source_paths)} 张源图（原图保留在原位置）"
                     f" —— 请点击顶部「规范素材尺寸」按钮生成规范素材图。")
+                self.progress_var.set("")
             if not self.queue:
                 self._show_import_preview()
 
@@ -1284,9 +1372,10 @@ def main():
             fs = filedialog.askopenfilenames(title="选择图片文件", filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
             if fs:
                 self.source_paths = list(fs)  # 替换当前源
-                self.progress_var.set(
+                self.info_var.set(
                     f"已导入 {len(self.source_paths)} 张源图（原图保留在原位置）"
                     f" —— 请点击顶部「规范素材尺寸」按钮生成规范素材图。")
+                self.progress_var.set("")
             if not self.queue:
                 self._show_import_preview()
         def move_up(self):
@@ -1345,28 +1434,39 @@ def main():
                     min(int(lg["w"]), int(lg["h"])))
 
         def _confirm_step1(self, sources, label) -> bool:
-            """step1 执行前的确认弹窗：按**当前档位**实时列出处理效果。"""
+            """step1 执行前的确认弹窗：按**当前档位**实时列出处理效果。
+
+            用富文本对话框把「处理张数」「档位尺寸」「短边夹逼上下限」等着重
+            颜色标注，帮助用户一眼抓住变化值。
+            """
             t = self.cfg.get("tiers") or {}
             sm = t.get("small") or {"w": 1280, "h": 720}
             lg = t.get("large") or {"w": 2560, "h": 1440}
             lo, hi = self._clamp_range()
-            msg = (
-                f"即将处理 {len(sources)} 张图片（来源：{label}）\n\n"
-                f"当前档位设置\n"
-                f"        小档    {sm['w']} × {sm['h']}\n"
-                f"        大档    {lg['w']} × {lg['h']}\n\n"
-                f"step1 会把每张图按「短边」夹逼到 {lo} ~ {hi}：\n\n"
-                f"        ●  短边 < {lo}\n"
-                f"           等比放大，短边拉到 {lo}\n\n"
-                f"        ●  {lo} ≤ 短边 ≤ {hi}\n"
-                f"           保持原尺寸，不做任何缩放\n\n"
-                f"        ●  短边 > {hi}\n"
-                f"           等比缩小，短边压到 {hi}\n\n"
-                f"全程保持原始宽高比，不裁剪、不拉伸。\n"
-                f"源图不会被修改，结果写入「规范素材图/」文件夹。\n\n"
-                f"是否继续执行？"
-            )
-            return self._msg_yesno("确认执行「规范素材尺寸」", msg)
+            n = len(sources)
+            lines = [
+                _RichLine(f"即将处理 {n} 张图片（来源：{label}）", style="dark"),
+                _RichLine(""),
+                _RichLine("当前档位设置", style="secondary"),
+                _RichLine(f"        小档    {sm['w']} × {sm['h']}", style="primary"),
+                _RichLine(f"        大档    {lg['w']} × {lg['h']}", style="primary"),
+                _RichLine(""),
+                _RichLine(f"step1 会把每张图按「短边」夹逼到 {lo} ~ {hi}：",
+                          style="dark"),
+                _RichLine(f"        ●  短边 < {lo}", style="secondary"),
+                _RichLine(f"           等比放大，短边拉到 {lo}", style="danger"),
+                _RichLine(f"        ●  {lo} ≤ 短边 ≤ {hi}", style="secondary"),
+                _RichLine("           保持原尺寸，不做任何缩放", style="secondary"),
+                _RichLine(f"        ●  短边 > {hi}", style="secondary"),
+                _RichLine(f"           等比缩小，短边压到 {hi}", style="danger"),
+                _RichLine(""),
+                _RichLine("全程保持原始宽高比，不裁剪、不拉伸。", style="secondary"),
+                _RichLine("源图不会被修改，结果写入「规范素材图/」文件夹。",
+                          style="secondary"),
+                _RichLine(""),
+                _RichLine("是否继续执行？", style="dark"),
+            ]
+            return self._msg_yesno_rich("确认执行「规范素材尺寸」", lines)
 
         def run_step1(self):
             # 重入保护：连点按钮会起多个 worker 线程，同时往同一批文件名写 JPEG，
@@ -1563,8 +1663,7 @@ def main():
             name = self.queue[self.idx]
             path = os.path.join(self.dirs["spec"], name)
             try:
-                with Image.open(path) as im:
-                    self.img = im.convert("RGB")
+                self.img = _open_rgb(path)
             except Exception as e:
                 self._msg_error("无法打开", f"{name}\n{e}")
                 return
@@ -1574,9 +1673,8 @@ def main():
             self._render_preview()
             # 布局可能尚未完成（如 step1 后台线程刚回主线程），延迟再重绘一次确保画布不卡灰色
             self.root.after(40, self._draw)
+            # 右下角 = 计数主导的当前图状态；左下角 = 操作结果（不在此处覆盖）
             self.info_var.set(f"[{self.idx+1}/{len(self.queue)}] {name}  {self.img.size[0]}×{self.img.size[1]}")
-            # 底部状态栏同步显示 step2 的实时进度（第几张 / 共几张）
-            self.progress_var.set(f"裁剪进度：{self.idx+1}/{len(self.queue)}")
             # 同步队列列表高亮
             if hasattr(self, "queue_list"):
                 try:
@@ -1593,8 +1691,7 @@ def main():
             path = self.source_paths[0]
             name = os.path.basename(path)
             try:
-                with Image.open(path) as im:
-                    self.img = im.convert("RGB")
+                self.img = _open_rgb(path)
             except Exception as e:
                 self._msg_error("无法打开", f"{name}\n{e}")
                 return
@@ -1992,11 +2089,8 @@ def main():
             if self.queue:
                 self.idx = 0
                 self._load_current()
-                # _load_current 已把 progress_var 设成「裁剪进度：x/N」，
-                # 这里补上导出结果，进度计数才不会被覆盖掉
-                self.progress_var.set(
-                    f"裁剪进度：{self.idx+1}/{len(self.queue)}"
-                    f" · 已导出：{os.path.basename(dest)}")
+                # 右下角 info_var 已自动变成 [1/N] name W×H，左下角只保留操作结果
+                self.progress_var.set(f"已导出：{os.path.basename(dest)}")
             else:
                 self.img = None
                 self.img_name = None
