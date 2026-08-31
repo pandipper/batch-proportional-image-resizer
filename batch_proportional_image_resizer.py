@@ -488,8 +488,11 @@ def crop_for_tier(img: Image.Image, bw: int, bh: int, fx: float, fy: float) -> I
 
 def main():
     import tkinter as tk
-    from tkinter import filedialog, messagebox
+    from tkinter import filedialog
     import ttkbootstrap as ttkb
+    # 美化版消息框（跟随 minty 主题）：替代 tkinter 原生 messagebox。
+    # buttons 支持 "文案:bootstyle" 写法，localize=False 避免中文按钮被再翻译。
+    from ttkbootstrap.dialogs import Messagebox
     # ttkbootstrap 2.x 顶层直接导出各控件（ttkb.Frame/Button/Spinbox...），
     # 没有独立的 ttk 子模块；用别名 ttk 让既有调用点 ttk.X 落到 ttkb 顶层。
     ttk = ttkb
@@ -1248,12 +1251,32 @@ def main():
             else:
                 self._draw()                  # 关闭时立即清屏并显示提示
 
+        # ---------------- 美化版消息框 ----------------
+        # 统一走 ttkbootstrap 的 Messagebox，样式跟随当前主题；按钮文案用中文，
+        # localize=False 防止 MessageCatalog 再翻译一遍。
+        def _msg_info(self, title: str, message: str) -> None:
+            Messagebox.show_info(message=message, title=title, parent=self.root,
+                                 buttons=["确定:primary"], localize=False, width=60)
+
+        def _msg_error(self, title: str, message: str) -> None:
+            Messagebox.show_error(message=message, title=title, parent=self.root,
+                                  buttons=["确定:danger"], localize=False, width=60)
+
+        def _msg_yesno(self, title: str, message: str) -> bool:
+            """返回 True = 用户点了「是」。Esc / 关闭窗口都算取消。"""
+            ans = Messagebox.yesno(message=message, title=title, parent=self.root,
+                                   buttons=["否:secondary", "是:primary"],
+                                   localize=False, width=64)
+            return ans == "是"
+
         # ---------------- 导入 ----------------
         def import_folder(self):
             d = filedialog.askdirectory(title="选择源图片文件夹")
             if d:
                 self.source_paths = [os.path.join(d, n) for n in list_source_images(d)]
-                self.progress_var.set(f"已导入文件夹：{len(self.source_paths)} 张（源图保留在原位置）。点「规范素材尺寸」生成规范素材图。")
+                self.progress_var.set(
+                    f"已导入 {len(self.source_paths)} 张源图（原图保留在原位置）"
+                    f" —— 请点击顶部「规范素材尺寸」按钮生成规范素材图。")
             if not self.queue:
                 self._show_import_preview()
 
@@ -1261,7 +1284,9 @@ def main():
             fs = filedialog.askopenfilenames(title="选择图片文件", filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")])
             if fs:
                 self.source_paths = list(fs)  # 替换当前源
-                self.progress_var.set(f"已导入文件：{len(self.source_paths)} 张。点「规范素材尺寸」生成规范素材图。")
+                self.progress_var.set(
+                    f"已导入 {len(self.source_paths)} 张源图（原图保留在原位置）"
+                    f" —— 请点击顶部「规范素材尺寸」按钮生成规范素材图。")
             if not self.queue:
                 self._show_import_preview()
         def move_up(self):
@@ -1307,21 +1332,62 @@ def main():
                 return cand, "规范素材图（重新归一化）"
             return [], ""
 
+        def _clamp_range(self):
+            """当前档位推算出的短边夹逼区间 [下限, 上限]。
+
+            档位在右栏可随时改，所以所有面向用户的文案都必须现算，不能写死 720/1440，
+            否则用户把大档改成 2000×1200 后弹窗还在说 1440，就成了假信息。
+            """
+            t = self.cfg.get("tiers") or {}
+            sm = t.get("small") or {"w": 1280, "h": 720}
+            lg = t.get("large") or {"w": 2560, "h": 1440}
+            return (min(int(sm["w"]), int(sm["h"])),
+                    min(int(lg["w"]), int(lg["h"])))
+
+        def _confirm_step1(self, sources, label) -> bool:
+            """step1 执行前的确认弹窗：按**当前档位**实时列出处理效果。"""
+            t = self.cfg.get("tiers") or {}
+            sm = t.get("small") or {"w": 1280, "h": 720}
+            lg = t.get("large") or {"w": 2560, "h": 1440}
+            lo, hi = self._clamp_range()
+            msg = (
+                f"即将处理 {len(sources)} 张图片（来源：{label}）\n\n"
+                f"当前档位设置\n"
+                f"        小档    {sm['w']} × {sm['h']}\n"
+                f"        大档    {lg['w']} × {lg['h']}\n\n"
+                f"step1 会把每张图按「短边」夹逼到 {lo} ~ {hi}：\n\n"
+                f"        ●  短边 < {lo}\n"
+                f"           等比放大，短边拉到 {lo}\n\n"
+                f"        ●  {lo} ≤ 短边 ≤ {hi}\n"
+                f"           保持原尺寸，不做任何缩放\n\n"
+                f"        ●  短边 > {hi}\n"
+                f"           等比缩小，短边压到 {hi}\n\n"
+                f"全程保持原始宽高比，不裁剪、不拉伸。\n"
+                f"源图不会被修改，结果写入「规范素材图/」文件夹。\n\n"
+                f"是否继续执行？"
+            )
+            return self._msg_yesno("确认执行「规范素材尺寸」", msg)
+
         def run_step1(self):
             # 重入保护：连点按钮会起多个 worker 线程，同时往同一批文件名写 JPEG，
             # 轻则互相覆盖、重则半张图。这里直接挡掉，并给出可见反馈。
             if getattr(self, "_step1_busy", False):
-                messagebox.showinfo(
+                self._msg_info(
                     "提示",
                     "「规范素材尺寸」正在处理中，请等这一批跑完。\n"
                     "（想中止可按 Esc，已完成的图片会保留）")
                 return
             sources, label = self._resolve_step1_sources()
             if not sources:
-                messagebox.showinfo(
+                self._msg_info(
                     "提示",
                     "没有可处理的图片。\n"
                     "请先点左侧「导入文件夹 / 导入文件」把图片加入导入队列，再点此按钮。")
+                return
+            # 执行前确认：把 step1 的实际效果（按当前档位算出来）摆给用户看，
+            # 避免新用户不知道这一步会做什么、会不会动到源图。
+            if not self._confirm_step1(sources, label):
+                self.progress_var.set("已取消「规范素材尺寸」（未处理任何图片）")
                 return
             self._step1_label = label
             self._step1_busy = True
@@ -1350,9 +1416,10 @@ def main():
                     else:
                         self.root.after(0, lambda: self.progress_var.set(
                             f"规范素材尺寸完成：成功 {ok}，跳过 {skip}；"
-                            f"按短边夹逼到 [720,1440]（短边达标即不缩放），原比例不变"))
+                            f"按短边夹逼到 [{self._clamp_range()[0]},{self._clamp_range()[1]}]"
+                            f"（短边达标即不缩放），原比例不变"))
                 except Exception as e:
-                    self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+                    self.root.after(0, lambda: self._msg_error("错误", str(e)))
                 finally:
                     # 先清标志再回调：_after_step1 里若再触发 run_step1 不会被误挡
                     self._step1_busy = False
@@ -1499,7 +1566,7 @@ def main():
                 with Image.open(path) as im:
                     self.img = im.convert("RGB")
             except Exception as e:
-                messagebox.showerror("无法打开", f"{name}\n{e}")
+                self._msg_error("无法打开", f"{name}\n{e}")
                 return
             self.img_name = name
             self._place_box_default()
@@ -1508,6 +1575,8 @@ def main():
             # 布局可能尚未完成（如 step1 后台线程刚回主线程），延迟再重绘一次确保画布不卡灰色
             self.root.after(40, self._draw)
             self.info_var.set(f"[{self.idx+1}/{len(self.queue)}] {name}  {self.img.size[0]}×{self.img.size[1]}")
+            # 底部状态栏同步显示 step2 的实时进度（第几张 / 共几张）
+            self.progress_var.set(f"裁剪进度：{self.idx+1}/{len(self.queue)}")
             # 同步队列列表高亮
             if hasattr(self, "queue_list"):
                 try:
@@ -1527,7 +1596,7 @@ def main():
                 with Image.open(path) as im:
                     self.img = im.convert("RGB")
             except Exception as e:
-                messagebox.showerror("无法打开", f"{name}\n{e}")
+                self._msg_error("无法打开", f"{name}\n{e}")
                 return
             self.img_name = name
             self._place_box_default()
@@ -1667,8 +1736,9 @@ def main():
                 self._show_hint("窗口预览已关闭（设置 → 窗口预览：开）")
                 return
             if self.img is None:
-                # 空态提示：让「空」变成「在等导入」，而非「坏没坏」
-                self._show_hint("导入图片后在此裁剪")
+                # 空态提示：让「空」变成「在等导入」，而非「坏没坏」。
+                # 文案要点名下一步动作（新用户最容易卡在「不知道还要点规范素材尺寸」）。
+                self._show_hint("导入图片后，请先点击顶部「规范素材尺寸」按钮")
                 return
             cw = self.canvas.winfo_width() or 800
             ch = self.canvas.winfo_height() or 600
@@ -1922,12 +1992,17 @@ def main():
             if self.queue:
                 self.idx = 0
                 self._load_current()
+                # _load_current 已把 progress_var 设成「裁剪进度：x/N」，
+                # 这里补上导出结果，进度计数才不会被覆盖掉
+                self.progress_var.set(
+                    f"裁剪进度：{self.idx+1}/{len(self.queue)}"
+                    f" · 已导出：{os.path.basename(dest)}")
             else:
                 self.img = None
                 self.img_name = None
                 self._clear_canvas()
                 self.info_var.set("队列已全部处理完成。")
-            self.progress_var.set(f"已导出：{os.path.basename(dest)}")
+                self.progress_var.set("队列已全部处理完成。")
 
         def rework_prev(self):
             if not self.prev_src or not os.path.exists(self.prev_src):
@@ -1939,7 +2014,7 @@ def main():
                 self.progress_var.set(f"已返工：{os.path.basename(dest)}（移至 规范素材图/返工）")
                 self.prev_src = None
             except Exception as e:
-                messagebox.showerror("返工失败", str(e))
+                self._msg_error("返工失败", str(e))
 
         def retouch_prev(self):
             if not self.prev_result or not os.path.exists(self.prev_result):
@@ -1951,7 +2026,7 @@ def main():
                 self.progress_var.set(f"已精修：{os.path.basename(dest)}（移至 修改后成图/精修）")
                 self.prev_result = None
             except Exception as e:
-                messagebox.showerror("精修失败", str(e))
+                self._msg_error("精修失败", str(e))
 
         # ---------------- 纵横比 / 档位（夹逼范围）----------------
         def _build_ratio_tier_controls(self):
@@ -2183,7 +2258,7 @@ def main():
             try:
                 shutil.move(src, dest)
             except Exception as e:
-                messagebox.showerror("移除失败", str(e))
+                self._msg_error("移除失败", str(e))
                 return
             self._pop_queue_item(i)
             self.progress_var.set(f"已移除：{name}（保留于 规范素材图/已移除）")
