@@ -1,4 +1,5 @@
-# 批量图片等比例缩放工具 · Batch Proportional Image Resizer
+# 批量图片等比例缩放工具 · 
+Batch Proportional Image Resizer
 
 ![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
