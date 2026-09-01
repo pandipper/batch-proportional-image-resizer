@@ -94,18 +94,24 @@ except AttributeError:  # Pillow < 9.1
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
-DEFAULT_TIERS = {
-    "large": {"w": 2560, "h": 1440, "label": "大档"},
-    "small": {"w": 1280, "h": 720,  "label": "小档"},
-}
+# ───── 两种输出模式 ─────
+# clamp（夹逼模式）：step1 把短边夹逼到 [下限, 上限]，step2 只按纵横比取景，
+#   输出 = 裁剪框真实像素尺寸，绝不二次缩放，各图输出尺寸可以不同。
+# fixed（定尺模式）：step2 强制输出 fixed_size 指定的尺寸，小图会被放大。
+# 两种模式的参数集不同：夹逼用 short_range，定尺用 fixed_size。
+MODE_CLAMP = "clamp"
+MODE_FIXED = "fixed"
+
+DEFAULT_SHORT_RANGE = [1080, 1920]   # 夹逼模式：短边下限 / 上限
+DEFAULT_FIXED_SIZE = [1920, 1080]    # 定尺模式：输出宽 / 高
 
 DEFAULT_CONFIG = {
-    "active_tier": "large",
-    "ratio_lock": True,
+    "mode": MODE_CLAMP,
     "ratio": [16, 9],
+    "short_range": list(DEFAULT_SHORT_RANGE),
+    "fixed_size": list(DEFAULT_FIXED_SIZE),
     "font_size": 12,
     "theme": "minty",
-    "tiers": {k: dict(v) for k, v in DEFAULT_TIERS.items()},
 }
 
 
@@ -359,22 +365,43 @@ def load_config(path: str) -> Dict[str, Any]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            cfg.setdefault("active_tier", "large")
-            cfg.setdefault("ratio_lock", True)
+            # 旧格式（无 mode 字段，用 tiers/active_tier/ratio_lock）已废弃：
+            # v1.1.0 起参数集按模式拆分，这里只继承与模式无关的偏好设置，
+            # 其余一律回退到新默认值，避免旧档位数值把新的短边范围带偏。
+            if "mode" not in cfg:
+                cfg = {
+                    "font_size": cfg.get("font_size", 12),
+                    "theme": cfg.get("theme", "minty"),
+                }
+            cfg.setdefault("mode", MODE_CLAMP)
+            if cfg["mode"] not in (MODE_CLAMP, MODE_FIXED):
+                cfg["mode"] = MODE_CLAMP
             cfg.setdefault("ratio", [16, 9])
+            cfg.setdefault("short_range", list(DEFAULT_SHORT_RANGE))
+            cfg.setdefault("fixed_size", list(DEFAULT_FIXED_SIZE))
             cfg.setdefault("font_size", 12)
             cfg.setdefault("theme", "minty")
-            t = cfg.get("tiers", {})
-            for k in ("large", "small"):
-                if k in t and "w" in t[k] and "h" in t[k]:
-                    DEFAULT_TIERS[k]["w"] = int(t[k]["w"])
-                    DEFAULT_TIERS[k]["h"] = int(t[k]["h"])
-            if cfg.get("active_tier") not in DEFAULT_TIERS:
-                cfg["active_tier"] = "large"
+            _sanitize_pair(cfg, "short_range", DEFAULT_SHORT_RANGE)
+            _sanitize_pair(cfg, "fixed_size", DEFAULT_FIXED_SIZE)
+            _sanitize_pair(cfg, "ratio", [16, 9])
             return cfg
         except Exception:
             pass
     return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+def _sanitize_pair(cfg: Dict[str, Any], key: str, fallback: Sequence[int]) -> None:
+    """把 cfg[key] 规范成两个正整数的 [a, b]；非法则回退。短边范围额外保证 a <= b。"""
+    v = cfg.get(key)
+    try:
+        a, b = int(v[0]), int(v[1])
+        if a <= 0 or b <= 0:
+            raise ValueError
+        if key == "short_range" and a > b:
+            a, b = b, a
+        cfg[key] = [a, b]
+    except Exception:
+        cfg[key] = list(fallback)
 
 
 def save_config(path: str, cfg: Dict[str, Any]) -> None:
@@ -406,38 +433,47 @@ def list_source_images(folder: str) -> List[str]:
         return []
 
 
-def step1_target_size(iw: int, ih: int, tiers: Optional[Dict[str, Any]] = None, min_width: int = 1280, max_width: int = 2560) -> Tuple[int, int]:
-    """step1 归一化：以「短边」为基准夹逼到 [720, 1440]，最大限度保留画面。
+def _norm_range(short_range: Optional[Sequence[int]]) -> Tuple[int, int]:
+    """把任意来源的短边范围规范成 (下限, 上限)，并保证下限 <= 上限。"""
+    try:
+        lo, hi = int(short_range[0]), int(short_range[1])   # type: ignore[index]
+        if lo <= 0 or hi <= 0:
+            raise ValueError
+    except Exception:
+        lo, hi = DEFAULT_SHORT_RANGE
+    return (min(lo, hi), max(lo, hi))
 
-    规则（大小档 small=1280x720、large=2560x1440，其短边即高 720/1440）：
+
+def step1_target_size(iw: int, ih: int, short_range: Optional[Sequence[int]] = None) -> Tuple[int, int]:
+    """step1 归一化：以「短边」为基准夹逼到 [下限, 上限]，最大限度保留画面。
+
+    规则（默认 [1080, 1920]）：
       short = min(iw, ih)
-      720 <= short <= 1440  -> 不缩放，原尺寸保留
-      short < 720           -> 等比放大，使短边 = 720
-      short > 1440          -> 等比缩小，使短边 = 1440
+      short <  下限        -> 等比放大，使短边 = 下限
+      下限 <= short <= 上限 -> 不缩放，原尺寸保留
+      short >  上限        -> 等比缩小，使短边 = 上限
     始终保留原纵横比，不裁切、不拉伸；长边允许溢出（留待 step2 取景裁剪）。
-    短边上下限取自档位（small/large 的短边即其高），改 settings 档位时自动跟随。
+
+    v1.1.0 起短边范围直接由用户设定（夹逼模式），不再从大小档间接推算——
+    长边本来就由「短边 × 纵横比」唯一决定，设它是冗余的。
     返回 (w, h)（保持原图比例）。
     """
     if iw <= 0 or ih <= 0:
         return (max(1, iw), max(1, ih))
-    t = tiers or {}
-    sm = t.get("small") or {"w": min_width, "h": 720}
-    lg = t.get("large") or {"w": max_width, "h": int(max_width * 9 / 16)}
-    short_min = min(sm["w"], sm["h"])   # 720
-    short_max = min(lg["w"], lg["h"])   # 1440
+    lo, hi = _norm_range(short_range)
     short = min(iw, ih)
-    if short < short_min:
-        scale = short_min / short          # 短边不足 -> 放大到 720
-    elif short > short_max:
-        scale = short_max / short          # 短边过大 -> 缩小到 1440
+    if short < lo:
+        scale = lo / short              # 短边不足 -> 放大到下限
+    elif short > hi:
+        scale = hi / short              # 短边过大 -> 缩小到上限
     else:
-        scale = 1.0                        # 短边在范围内 -> 不动
+        scale = 1.0                     # 短边在范围内 -> 不动
     w = max(1, int(round(iw * scale)))
     h = max(1, int(round(ih * scale)))
     return (w, h)
 
 
-def process_step1(source_paths: Sequence[str], out_dir: str, quality: int = 100, on_progress: Optional[Callable[[int, int, str], bool]] = None, tiers: Optional[Dict[str, Any]] = None, min_width: int = 1280) -> Tuple[int, int]:
+def process_step1(source_paths: Sequence[str], out_dir: str, quality: int = 100, on_progress: Optional[Callable[[int, int, str], bool]] = None, short_range: Optional[Sequence[int]] = None) -> Tuple[int, int]:
     """对一组源图执行 step1，结果写入 out_dir（同名覆盖）。返回 (成功数, 跳过数)。
 
     `on_progress(i, total, src)` 在每张处理前调用，**返回 False 即中止**本轮
@@ -455,7 +491,7 @@ def process_step1(source_paths: Sequence[str], out_dir: str, quality: int = 100,
             continue
         try:
             im = _open_rgb(src)
-            tgt = step1_target_size(*im.size, tiers=tiers, min_width=min_width)
+            tgt = step1_target_size(*im.size, short_range=short_range)
             out = im.resize(tgt, _RESAMPLE)
             base = os.path.splitext(os.path.basename(src))[0] + ".jpg"
             out.save(os.path.join(out_dir, base), "JPEG", quality=quality)
@@ -688,21 +724,27 @@ def main():
     from ttkbootstrap.dialogs.message import MessageDialog
 
     class _RichLine:
-        __slots__ = ("text", "style", "indent", "pady")
-        def __init__(self, text="", style=None, indent=0, pady=None):
+        """富文本对话框的一行。
+
+        text 传 str  = 单列整行
+        text 传 list = 多列，各列独立着色；col_width 指定每列固定字符宽，
+                      对齐由容器保证，跟字号、字体、主题全都解耦（空格对齐做不到这点）。
+        """
+        __slots__ = ("text", "style", "indent", "pady", "col_width")
+        def __init__(self, text="", style=None, indent=0, pady=None, col_width=None):
             self.text = text
             self.style = style
             self.indent = indent
             self.pady = pady
+            self.col_width = col_width
 
     class _RichMessageDialog(MessageDialog):
         """ttkbootstrap MessageDialog 的富文本变体。
 
         正文拆成多行，每行可独立指定 ``bootstyle``（primary / success / warning /
-        danger / info / secondary / dark），从而把「短边下限 720」「上限 1440」
+        danger / info / secondary / dark），从而把「短边下限 1080」「上限 1920」
         这类对用户最重要的变化值用醒目颜色标出来。图标、按钮、居中、模态、
-        Esc 关闭等行为完全继承自官方 MessageDialog， visually 与原生
-        Messagebox 保持一致。
+        Esc 关闭等行为完全继承自官方 MessageDialog，视觉与原生 Messagebox 一致。
         """
         def __init__(self, lines, title=" ", buttons=None, parent=None,
                      alert=False, default=None, icon=None, **kwargs):
@@ -713,7 +755,6 @@ def main():
                              width=1, **kwargs)
 
         def create_body(self, master):
-            from ttkbootstrap.dialogs.message import _alert_icon
             container = ttk.Frame(master, padding=self._padding)
             if self._icon:
                 icon_lbl = self._create_icon_label(container)
@@ -721,19 +762,35 @@ def main():
                     icon_lbl.pack(side="left", anchor="center", padx=(0, 10))
             msg_frame = ttk.Frame(container)
             for line in self._lines:
+                pady = line.pady if line.pady is not None else (0, 3)
+                padx = (line.indent, 0)
+                if isinstance(line.text, (list, tuple)):
+                    row = ttk.Frame(msg_frame)
+                    styles = line.style if isinstance(line.style, (list, tuple)) \
+                        else [line.style] * len(line.text)
+                    widths = line.col_width if isinstance(line.col_width, (list, tuple)) \
+                        else [line.col_width] * len(line.text)
+                    for cell, st, wd in zip(line.text, styles, widths):
+                        kw = {"bootstyle": st} if st else {}
+                        # width 单位是「0」字符宽，中文通常占 2 个单位，
+                        # 指定固定 width 后各列起点由容器锁定，字体怎么变都不会错位
+                        if wd:
+                            kw["width"] = wd
+                        ttk.Label(row, text=cell, anchor="w", justify="left",
+                                  **kw).pack(side="left")
+                    row.pack(fill="x", anchor="n", pady=pady, padx=padx)
+                    continue
                 if line.text == "" or line.text is None:
                     ttk.Frame(msg_frame, height=8).pack(fill="x")
                     continue
-                kw = {}
-                if line.style:
-                    kw["bootstyle"] = line.style
-                pady = line.pady if line.pady is not None else (0, 3)
+                kw = {"bootstyle": line.style} if line.style else {}
                 # 约 8px/字符，60 字符对应 480px；超出自动折行
                 ttk.Label(msg_frame, text=line.text, anchor="w", justify="left",
                           wraplength=480, **kw).pack(
-                    fill="x", anchor="n", pady=pady, padx=(line.indent, 0))
+                    fill="x", anchor="n", pady=pady, padx=padx)
             msg_frame.pack(side="left", fill="x", expand=True, anchor="center")
             container.pack(fill="x", expand=True)
+
 
     class App:
         def __init__(self, root):
@@ -763,8 +820,11 @@ def main():
             r = self.cfg.get("ratio", [16, 9])
             self.ratio_w = tk.IntVar(value=int(r[0]))
             self.ratio_h = tk.IntVar(value=int(r[1]))
-            self.active_tier = self.cfg.get("active_tier", "large")   # 当前生效档（大档/小档，单选）
-            self.ratio_lock = self.cfg.get("ratio_lock", True)        # 纵横比联动：四值保持同一比例
+            self._step_timers = {}          # 步进器防抖定时器，_rebuild_params 销毁前统一取消
+            # 批次计数：导入总数与已执行数，供右下角「当前执行数/导入总数」使用。
+            # 不能用 idx+1 / len(queue)，因为导出后会从 queue 移除并把 idx 归零。
+            self.batch_total = 0
+            self.batch_done = 0
             self.prev_src = None            # 上一张：源文件路径
             self.prev_result = None         # 上一张：结果文件路径
             self.quality = tk.IntVar(value=100)
@@ -786,10 +846,10 @@ def main():
             self._pv_scale = 1.0     # 底图相对 COVER 尺寸的缩放系数（框也按此系数同步缩放）
             self._pending_pv = None  # 预览重绘的合并定时器
 
-            self._apply_theme()  # ttk.Style 必须在 _build_ui 之前配好
+            self._apply_theme()
             self._build_ui()
             self._refresh_queue()
-            self._focus_rescan()  # 首次加载
+            self._focus_rescan()
             self.root.bind("<FocusIn>", self._on_focus_in)
             # 点击任意控件后把焦点交还画布：确保空格等快捷键可靠触发，
             # 避免焦点停在按钮上导致空格被当成「再次点击该按钮」（表现为只刷新不裁剪）
@@ -923,7 +983,8 @@ def main():
             except Exception:
                 pass
             try:
-                self._refresh_headers()
+                self._paint_mode(False)
+                self._paint_ratio()
             except Exception:
                 pass
             # 处理区画布底色锁定为 E8E8E8，主题切换后强制重设，避免与父框背景混色而“消失”
@@ -1129,9 +1190,8 @@ def main():
             self.preview_ph = tk.Label(self.preview_box, image=self.preview_ph_img, bg=THEME["BG"])
             self.preview_ph.place(relx=0.5, rely=0.5, anchor="center")
 
-            # 夹逼范围（分组标题，无开关）→ 纵横比 / 大档 / 小档 三行
-            ttk.Label(self.left_content, text="夹逼范围", anchor="w", style="Muted.TLabel", font=FONT_BOLD).pack(fill=tk.X, pady=(6, 2))
-            self._build_ratio_tier_controls()
+            # 模式标题（可点切换 夹逼/定尺）+ 参数区（按模式重建）
+            self._build_mode_switch()
 
             # 旋转（单行图标按钮，无中文，仅此行为横排图标）
             grid = ttk.Frame(self.left_content)
@@ -1422,43 +1482,37 @@ def main():
             return [], ""
 
         def _clamp_range(self):
-            """当前档位推算出的短边夹逼区间 [下限, 上限]。
+            """当前设定的短边夹逼区间 [下限, 上限]。
 
-            档位在右栏可随时改，所以所有面向用户的文案都必须现算，不能写死 720/1440，
-            否则用户把大档改成 2000×1200 后弹窗还在说 1440，就成了假信息。
+            v1.1.0 起由用户直接设定（夹逼模式），不再从大小档推算。所有面向用户的
+            文案都必须现算，不能写死 1080/1920，否则用户改完弹窗还在说旧值，就是假信息。
             """
-            t = self.cfg.get("tiers") or {}
-            sm = t.get("small") or {"w": 1280, "h": 720}
-            lg = t.get("large") or {"w": 2560, "h": 1440}
-            return (min(int(sm["w"]), int(sm["h"])),
-                    min(int(lg["w"]), int(lg["h"])))
+            return _norm_range(self.cfg.get("short_range"))
 
         def _confirm_step1(self, sources, label) -> bool:
-            """step1 执行前的确认弹窗：按**当前档位**实时列出处理效果。
+            """step1 执行前的确认弹窗：按**当前短边范围**实时列出处理效果。
 
-            用富文本对话框把「处理张数」「档位尺寸」「短边夹逼上下限」等着重
-            颜色标注，帮助用户一眼抓住变化值。
+            三个分支用「固定列宽 + 双列容器」排版：第一列锁 21 字符宽，
+            第二列起点因此永远一致。不用空格对齐——空格宽度随字体变化，
+            改字号或换主题字体就会错位。
             """
-            t = self.cfg.get("tiers") or {}
-            sm = t.get("small") or {"w": 1280, "h": 720}
-            lg = t.get("large") or {"w": 2560, "h": 1440}
             lo, hi = self._clamp_range()
             n = len(sources)
             lines = [
                 _RichLine(f"即将处理 {n} 张图片（来源：{label}）", style="dark"),
                 _RichLine(""),
-                _RichLine("当前档位设置", style="secondary"),
-                _RichLine(f"        小档    {sm['w']} × {sm['h']}", style="primary"),
-                _RichLine(f"        大档    {lg['w']} × {lg['h']}", style="primary"),
-                _RichLine(""),
-                _RichLine(f"step1 会把每张图按「短边」夹逼到 {lo} ~ {hi}：",
+                _RichLine(f"「规范素材图」会把每张图按「短边」夹逼到 {lo} ~ {hi}：",
                           style="dark"),
-                _RichLine(f"        ●  短边 < {lo}", style="secondary"),
-                _RichLine(f"           等比放大，短边拉到 {lo}", style="danger"),
-                _RichLine(f"        ●  {lo} ≤ 短边 ≤ {hi}", style="secondary"),
-                _RichLine("           保持原尺寸，不做任何缩放", style="secondary"),
-                _RichLine(f"        ●  短边 > {hi}", style="secondary"),
-                _RichLine(f"           等比缩小，短边压到 {hi}", style="danger"),
+                # 三分支：第一列固定 21 字符宽，保证「等/保/等」三行第二列对齐
+                _RichLine([f"        短边 < {lo}",
+                           f"等比放大，短边拉到 {lo}"],
+                          style=["secondary", "danger"], col_width=[21, 0]),
+                _RichLine([f"        {lo} ≤ 短边 ≤ {hi}",
+                           "保持原尺寸，不做任何缩放"],
+                          style=["secondary", "secondary"], col_width=[21, 0]),
+                _RichLine([f"        短边 > {hi}",
+                           f"等比缩小，短边压到 {hi}"],
+                          style=["secondary", "danger"], col_width=[21, 0]),
                 _RichLine(""),
                 _RichLine("全程保持原始宽高比，不裁剪、不拉伸。", style="secondary"),
                 _RichLine("源图不会被修改，结果写入「规范素材图/」文件夹。",
@@ -1509,7 +1563,7 @@ def main():
                     ok, skip = process_step1(
                         sources, self.dirs["spec"],
                         quality=self.quality.get(), on_progress=cb,
-                        tiers=self.cfg["tiers"])
+                        short_range=self.cfg.get("short_range"))
                     if getattr(self, "_step1_cancel", False):
                         self.root.after(0, lambda: self.progress_var.set(
                             f"已中止「规范素材尺寸」：本次完成 {ok} 张，跳过 {skip} 张"))
@@ -1541,6 +1595,11 @@ def main():
             # 这批导入源已处理为规范素材图，清空导入列表并刷新状态
             self.source_paths = []
             self._refresh_queue()
+            # 新一轮开始：导入总数 = 队列长度，已执行数归零。
+            # 右下角显示「已执行/导入总数」，数字单调递增，才有统计意义
+            # （用 idx+1 / len(queue) 的话，导出后队列缩短、idx 归零，永远是 1/N-1）。
+            self.batch_total = len(self.queue)
+            self.batch_done = 0
             self.idx = 0
             self._load_current()
 
@@ -1673,8 +1732,13 @@ def main():
             self._render_preview()
             # 布局可能尚未完成（如 step1 后台线程刚回主线程），延迟再重绘一次确保画布不卡灰色
             self.root.after(40, self._draw)
-            # 右下角 = 计数主导的当前图状态；左下角 = 操作结果（不在此处覆盖）
-            self.info_var.set(f"[{self.idx+1}/{len(self.queue)}] {name}  {self.img.size[0]}×{self.img.size[1]}")
+            # 右下角 = 计数主导：「已执行数/导入总数」。总数在 step1 完成时定下来，
+            # 已执行数在每次导出后 +1。不用 idx+1/len(queue)——导出会缩短队列并
+            # 把 idx 归零，那样永远显示 1/N-1，没有统计意义。
+            total = self.batch_total or len(self.queue)
+            done = min(self.batch_done + 1, total)
+            self.info_var.set(
+                f"[{done}/{total}] {name}  {self.img.size[0]}×{self.img.size[1]}")
             # 同步队列列表高亮
             if hasattr(self, "queue_list"):
                 try:
@@ -1699,21 +1763,47 @@ def main():
             self._place_box_default()
             self._draw()
             self._render_preview()
+            # 右下角仍是计数主导：step1 尚未执行，已执行数记 0。
+            # 文案点名下一步动作（新用户最容易卡在不知道还要点「规范素材尺寸」）。
+            total = len(self.source_paths)
             self.info_var.set(
-                f"导入预览 {name}  {self.img.size[0]}×{self.img.size[1]} —— 需先「规范素材尺寸」")
+                f"[0/{total}] 已导入 {total} 张 · 请点击「规范素材尺寸」")
 
-        def _current_box_size(self):
-            """当前生效档（大档/小档，手动单选）的裁剪框尺寸。"""
-            t = self.cfg["tiers"][self.active_tier]
-            return t["w"], t["h"]
+        def _box_px(self) -> Tuple[int, int]:
+            """裁剪框当前的真实像素尺寸（图像坐标）。
+
+            拖动 / 角柄缩放后这个值会变，夹逼模式导出时直接按它输出。
+            """
+            x0, y0, x1, y1 = self.box
+            return (max(1, x1 - x0), max(1, y1 - y0))
+
+        def _target_box_size(self, iw: int, ih: int) -> Tuple[int, int]:
+            """取景框的目标像素尺寸。
+
+            夹逼模式：图内最大「纵横比」内接框 —— 由图片尺寸决定，绝不超出图片，
+            因此后续裁剪不需要放大。
+            定尺模式：fixed_size 指定的固定尺寸，超出图片部分由 _clamp_box 内接，
+            导出时再放大回该尺寸。
+            """
+            if self.cfg.get("mode") == MODE_FIXED:
+                w, h = self.cfg.get("fixed_size", DEFAULT_FIXED_SIZE)
+                return (max(1, int(w)), max(1, int(h)))
+            rw = max(1, int(self.ratio_w.get()))
+            rh = max(1, int(self.ratio_h.get()))
+            r = rw / rh
+            if iw <= 0 or ih <= 0:
+                return (max(1, iw), max(1, ih))
+            # 图比目标比例宽 -> 高度受限；否则宽度受限
+            if iw / ih > r:
+                return (max(1, round(ih * r)), ih)
+            return (iw, max(1, round(iw / r)))
 
         def _place_box_default(self):
             if self.img is None:
                 return
-            bw, bh = self._current_box_size()
             iw, ih = self.img.size
-            # 先按锚点放置（默认居中）；素材比档位小时，夹为图像内「贴边的夹逼框」
-            # （与图像同比例、居中内接），避免裁剪框超出图片范围
+            bw, bh = self._target_box_size(iw, ih)
+            # 先按锚点放置（默认居中）；框超出图片时由 _clamp_box 收进图内
             box, anchor = anchor_to_box(
                 self.last_anchor[0], self.last_anchor[1], iw, ih, bw, bh)
             box = self._clamp_box(box, iw, ih)
@@ -1897,8 +1987,8 @@ def main():
                 self.preview_ph.place(relx=0.5, rely=0.5, anchor="center")  # 显示占位
                 return
             self.preview_ph.place_forget()  # 有图则隐藏占位
-            bw, bh = self._current_box_size()
             iw, ih = self.img.size
+            bw, bh = self._target_box_size(iw, ih)
             key = (id(self.img), bw, bh)
             if self._pv_key != key or self._pv_base is None:
                 cs = cover_scale(iw, ih, bw, bh)
@@ -1976,13 +2066,14 @@ def main():
                 ny0 = max(0, min(ny0, ih - h))
                 self.box = (int(nx0), int(ny0), int(nx0 + w), int(ny0 + h))
             elif mode == "recenter":
-                bw, bh = self._current_box_size()
+                # 用框当前的实际尺寸（尊重用户的缩放），而非档位名义尺寸
+                bw, bh = self._box_px()
                 cx, cy = max(bw/2, min(ix, iw - bw/2)), max(bh/2, min(iy, ih - bh/2))
                 self.box = (int(cx - bw/2), int(cy - bh/2), int(cx + bw/2), int(cy + bh/2))
                 self.last_anchor = (cx / iw, cy / ih)
             elif mode.startswith("resize"):
-                bw, bh = self._current_box_size()
-                # 16:9 锁定：以对角为锚，按鼠标决定宽
+                bw, bh = self._box_px()
+                # 按框当前的宽高比锁定（16:9 只是默认值），以对角为锚，按鼠标决定宽
                 x0, y0, x1, y1 = self.drag["box0"]
                 if mode in ("resize_nw", "resize_se"):
                     anchor_x, anchor_y = (x1, y1) if mode == "resize_nw" else (x0, y0)
@@ -2065,9 +2156,15 @@ def main():
             if self.img_name not in self.queue:
                 self.progress_var.set("该图尚未进入素材队列（规范素材图），请先「规范素材尺寸」再裁剪。")
                 return
-            bw, bh = self._current_box_size()
-            fx, fy = self._box_anchor()
-            out = crop_for_tier(self.img, bw, bh, fx, fy)
+            # 两种模式走两条路：
+            #   夹逼模式 —— 框一定在图内，直接按框裁，不缩放，输出 = 框的真实像素尺寸
+            #   定尺模式 —— 输出固定尺寸，框不够大时由 crop_for_tier 放大补足
+            if self.cfg.get("mode") == MODE_FIXED:
+                bw, bh = self._target_box_size(*self.img.size)
+                fx, fy = self._box_anchor()
+                out = crop_for_tier(self.img, bw, bh, fx, fy)
+            else:
+                out = self.img.crop(self.box)
             base = os.path.splitext(self.img_name)[0]
             fmt = self.out_format.get()
             if fmt == "PNG":
@@ -2079,6 +2176,7 @@ def main():
             # 记录上一张（源 + 结果）
             self.prev_src = os.path.join(self.dirs["spec"], self.img_name)
             self.prev_result = dest
+            self.batch_done += 1           # 已执行数 +1，供右下角「当前执行数/导入总数」
             # 从内存队列移除（文件保留，待 FocusIn 重扫时因已存在结果而跳过）
             if self.img_name in self.queue:
                 self.queue.remove(self.img_name)
@@ -2089,14 +2187,17 @@ def main():
             if self.queue:
                 self.idx = 0
                 self._load_current()
-                # 右下角 info_var 已自动变成 [1/N] name W×H，左下角只保留操作结果
-                self.progress_var.set(f"已导出：{os.path.basename(dest)}")
+                # 右下角 info_var 已是「[已执行/总数] 名 W×H」，左下角只放操作结果
+                self.progress_var.set(
+                    f"已导出：{os.path.basename(dest)}  {out.size[0]}×{out.size[1]}")
             else:
                 self.img = None
                 self.img_name = None
                 self._clear_canvas()
-                self.info_var.set("队列已全部处理完成。")
-                self.progress_var.set("队列已全部处理完成。")
+                self.info_var.set(
+                    f"队列已全部处理完成  {self.batch_done}/{self.batch_total}")
+                self.progress_var.set(
+                    f"已导出：{os.path.basename(dest)}  {out.size[0]}×{out.size[1]}")
 
         def rework_prev(self):
             if not self.prev_src or not os.path.exists(self.prev_src):
@@ -2122,59 +2223,245 @@ def main():
             except Exception as e:
                 self._msg_error("精修失败", str(e))
 
-        # ---------------- 纵横比 / 档位（夹逼范围）----------------
-        def _build_ratio_tier_controls(self):
-            lc = self.left_content
-            # v8 网格：行首开关锁 73px、两个步进器权重 1 撑开、分隔符锁 20px，
-            # 整行与旋转行同宽（均 full-width），故左右边缘对齐。
-            TOGGLE_W, SEP_W = 73, 20
+        # ---------------- 模式 / 纵横比 / 参数（夹逼 or 定尺）----------------
 
-            def _row(parent):
-                f = ttk.Frame(parent)
-                f.pack(fill=tk.X, pady=3)
-                f.columnconfigure(0, minsize=TOGGLE_W, weight=0)
-                f.columnconfigure(1, weight=1)
-                f.columnconfigure(2, minsize=SEP_W, weight=0)
-                f.columnconfigure(3, weight=1)
-                return f
+        def _build_mode_switch(self):
+            """模式标题行：整块可点，在「夹逼模式」与「定尺模式」间切换。
 
-            # 纵横比（行首开关 + 宽:高 步进）
-            rf = _row(lc)
-            self.ratio_btn = self._make_header_btn(rf, "纵横比", self.toggle_ratio_lock)
-            self.ratio_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-            wf = self._make_stepper(rf, self.ratio_w, 1, 4, self._on_ratio_changed)
-            wf.grid(row=0, column=1, sticky="nsew", padx=2)
-            ttk.Label(rf, text=":", anchor="center", width=2).grid(row=0, column=2, sticky="nsew")
-            hf = self._make_stepper(rf, self.ratio_h, 1, 4, self._on_ratio_changed)
-            hf.grid(row=0, column=3, sticky="nsew", padx=(2, 0))
-            self.ratio_entries = [wf, hf]
+            跟状态栏的 @pandipper 同一种交互（Label + cursor + 点击回调），
+            零额外高度。可发现性靠 primary 配色 + hover 变色。
+            """
+            self.mode_label = ttk.Label(
+                self.left_content, text="", anchor="w",
+                style="Muted.TLabel", font=FONT_BOLD, cursor="hand2")
+            self.mode_label.pack(fill=tk.X, pady=(6, 2))
+            self.mode_label.bind("<Button-1>", lambda _e: self._toggle_mode())
+            self.mode_label.bind("<Enter>", lambda _e: self._paint_mode(True))
+            self.mode_label.bind("<Leave>", lambda _e: self._paint_mode(False))
+            self._set_tip(self.mode_label, "点击切换 夹逼模式 / 定尺模式")
 
-            # 大档 / 小档（行首单选 + 宽×高 步进）
-            self.tier_vars = {}
-            self.tier_btns = {}
-            self.tier_h_entries = {}
-            for key in ("large", "small"):
-                t = self.cfg["tiers"][key]
-                row = _row(lc)
-                btn = self._make_header_btn(row, t["label"], lambda k=key: self._set_tier_active(k))
-                btn.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-                self.tier_btns[key] = btn
-                svars = {}
-                wf = self._make_stepper(row, tk.IntVar(value=t["w"]), 1, 4, (lambda k=key: self._on_tier_changed(k, "w")))
-                wf.grid(row=0, column=1, sticky="nsew", padx=2)
-                svars["w"] = wf._var
-                ttk.Label(row, text="×", anchor="center", width=2).grid(row=0, column=2, sticky="nsew")
-                hf = self._make_stepper(row, tk.IntVar(value=t["h"]), 1, 4, (lambda k=key: self._on_tier_changed(k, "h")))
-                hf.grid(row=0, column=3, sticky="nsew", padx=(2, 0))
-                svars["h"] = hf._var
-                self.tier_vars[key] = svars
-                self.tier_h_entries[key] = hf
-            self._refresh_headers()
+            # 参数区容器：切模式时只销毁重建这里的内容，不动整个窗口
+            self.params_box = ttk.Frame(self.left_content)
+            self.params_box.pack(fill=tk.X)
+            self._paint_mode(False)         # 设模式标题的初始文字与配色（否则 text="" 不可见）
+            self._rebuild_params()
 
-        def _make_header_btn(self, parent, text, command, icon=None):
-            """行首开关按钮：点击切换状态（纵横比=开/关，档位=选中/未选）。
-            固定 width 让 纵横比/大档/小档 三行左列宽度一致。"""
-            return mk_btn(parent, text=text, icon=icon, bootstyle="secondary-outline", command=command, width=85)
+        def _mode_text(self) -> str:
+            if self.cfg.get("mode") == MODE_FIXED:
+                w, h = self.cfg.get("fixed_size", DEFAULT_FIXED_SIZE)
+                return f"定尺模式   {w} × {h}"
+            lo, hi = self.cfg.get("short_range", DEFAULT_SHORT_RANGE)
+            return f"夹逼模式   短边 {lo} ~ {hi}"
+
+        def _paint_mode(self, hover: bool) -> None:
+            """primary 配色表示「可点」；hover 时加深一档。"""
+            try:
+                self.mode_label.configure(
+                    text=self._mode_text(),
+                    foreground=THEME["PRIMARY_H"] if hover else THEME["PRIMARY"])
+            except Exception:
+                pass
+
+        def _toggle_mode(self):
+            """切换模式。
+
+            夹逼 → 定尺：把输出尺寸对齐到当前短边上限（宽 = 上限 × 比例），
+                让用户从夹逼切过去时得到一个和刚才尺度相当的定尺值。
+            定尺 → 夹逼：**不动** short_range —— 它是 step1 的归一化参数，
+                两种模式共用，覆盖掉会让用户之前的短边设置丢失。
+            """
+            if self.cfg.get("mode") == MODE_CLAMP:
+                _lo, hi = _norm_range(self.cfg.get("short_range"))
+                rw, rh = int(self.ratio_w.get()), int(self.ratio_h.get())
+                r = rw / max(1, rh)
+                self.cfg["fixed_size"] = [max(1, round(hi * r)), max(1, hi)]
+                self.cfg["mode"] = MODE_FIXED
+            else:
+                self.cfg["mode"] = MODE_CLAMP
+            self._save_cfg()
+            self._paint_mode(False)
+            self._rebuild_params()
+            self._refresh_after_param_change()
+
+        def _rebuild_params(self):
+            """销毁并重建参数区。两种模式的参数行不同，只能重建。
+
+            销毁前必须取消挂起的防抖定时器：_make_stepper 里有 after(120,...)，
+            控件销毁后回调会打到已死的 Spinbox 上。
+            """
+            for tid in list(getattr(self, "_step_timers", {}).values()):
+                if tid:
+                    try:
+                        self.root.after_cancel(tid)
+                    except Exception:
+                        pass
+            self._step_timers = {}
+            for w in self.params_box.winfo_children():
+                w.destroy()
+            self._build_ratio_row(self.params_box)
+            if self.cfg.get("mode") == MODE_CLAMP:
+                self._build_clamp_rows(self.params_box)
+            else:
+                self._build_fixed_rows(self.params_box)
+
+        def _param_row(self, parent, label_text):
+            """一行：左侧固定宽标签 + 右侧内容区。"""
+            f = ttk.Frame(parent)
+            f.pack(fill=tk.X, pady=3)
+            f.columnconfigure(0, minsize=73, weight=0)
+            f.columnconfigure(1, weight=1)
+            ttk.Label(f, text=label_text, anchor="w").grid(
+                row=0, column=0, sticky="nsew", padx=(0, 4))
+            return f
+
+        def _build_ratio_row(self, parent):
+            """纵横比行：标签「纵横比」可点定向切换，冒号可点 toggle。
+
+            高亮语义统一为「primary = 可交互 + 当前状态」：
+              标签高亮「横」= 当前横版，高亮「纵」= 当前竖版
+              冒号常亮       = 点它能切换
+            """
+            row = self._param_row(parent, "")
+            lbl = ttk.Frame(row)
+            lbl.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+            self.ratio_l_zong = ttk.Label(lbl, text="纵", anchor="w", cursor="hand2")
+            self.ratio_l_zong.pack(side=tk.LEFT)
+            self.ratio_l_heng = ttk.Label(lbl, text="横", anchor="w", cursor="hand2")
+            self.ratio_l_heng.pack(side=tk.LEFT)
+            self.ratio_l_bi = ttk.Label(lbl, text="比", anchor="w", cursor="hand2")
+            self.ratio_l_bi.pack(side=tk.LEFT)
+
+            vals = ttk.Frame(row)
+            vals.grid(row=0, column=1, sticky="nsew")
+            vals.columnconfigure(0, weight=1)
+            vals.columnconfigure(2, weight=1)
+            self.ratio_w_spin = self._make_stepper(
+                vals, self.ratio_w, 1, 4, self._on_ratio_changed)
+            self.ratio_w_spin.grid(row=0, column=0, sticky="nsew", padx=2)
+            self.ratio_colon = ttk.Label(vals, text=":", anchor="center",
+                                         width=2, cursor="hand2")
+            self.ratio_colon.grid(row=0, column=1, sticky="nsew")
+            self.ratio_h_spin = self._make_stepper(
+                vals, self.ratio_h, 1, 4, self._on_ratio_changed)
+            self.ratio_h_spin.grid(row=0, column=2, sticky="nsew", padx=(2, 0))
+
+            # 「纵」「横」定向切换；点「比」或冒号则 toggle
+            self.ratio_l_zong.bind("<Button-1>", lambda _e: self._set_orientation(False))
+            self.ratio_l_heng.bind("<Button-1>", lambda _e: self._set_orientation(True))
+            self.ratio_l_bi.bind("<Button-1>", lambda _e: self._swap_orientation())
+            self.ratio_colon.bind("<Button-1>", lambda _e: self._swap_orientation())
+            self._set_tip(self.ratio_colon, "点击切换横版 / 竖版")
+            self._paint_ratio()
+
+        def _is_landscape(self) -> bool:
+            try:
+                return int(self.ratio_w.get()) >= int(self.ratio_h.get())
+            except Exception:
+                return True
+
+        def _set_orientation(self, landscape: bool) -> None:
+            """切到横版（宽>=高）或竖版；已是目标方向则不动。"""
+            if self._is_landscape() == landscape:
+                return
+            self._swap_orientation()
+
+        def _swap_orientation(self):
+            """交换比例的宽高，并同步交换定尺模式的输出尺寸宽高。"""
+            rw, rh = int(self.ratio_w.get()), int(self.ratio_h.get())
+            self.ratio_w.set(rh)
+            self.ratio_h.set(rw)
+            fw, fh = self.cfg.get("fixed_size", DEFAULT_FIXED_SIZE)
+            self.cfg["fixed_size"] = [int(fh), int(fw)]
+            self._save_cfg()
+            self._paint_ratio()
+            self._paint_mode(False)
+            self._refresh_after_param_change()
+
+        def _paint_ratio(self):
+            """标签高亮当前方向那个字；冒号常亮表示可点。"""
+            land = self._is_landscape()
+            try:
+                self.ratio_l_zong.configure(
+                    foreground=THEME["PRIMARY"] if not land else THEME["TEXT"])
+                self.ratio_l_heng.configure(
+                    foreground=THEME["PRIMARY"] if land else THEME["TEXT"])
+                self.ratio_colon.configure(foreground=THEME["PRIMARY"])
+            except Exception:
+                pass
+
+        def _build_clamp_rows(self, parent):
+            """夹逼模式：短边下限 / 短边上限。"""
+            lo, hi = self.cfg.get("short_range", DEFAULT_SHORT_RANGE)
+            self.short_lo = tk.IntVar(value=lo)
+            self.short_hi = tk.IntVar(value=hi)
+            for text, var in (("短边下限", self.short_lo), ("短边上限", self.short_hi)):
+                row = self._param_row(parent, text)
+                self._make_stepper(row, var, 1, 6, self._on_short_range_changed
+                                   ).grid(row=0, column=1, sticky="nsew", padx=2)
+
+        def _build_fixed_rows(self, parent):
+            """定尺模式：宽度 / 高度。"""
+            fw, fh = self.cfg.get("fixed_size", DEFAULT_FIXED_SIZE)
+            self.fixed_w = tk.IntVar(value=fw)
+            self.fixed_h = tk.IntVar(value=fh)
+            for text, var, dim in (("宽度", self.fixed_w, 0), ("高度", self.fixed_h, 1)):
+                row = self._param_row(parent, text)
+                self._make_stepper(row, var, 1, 6,
+                                   lambda d=dim: self._on_fixed_size_changed(d)
+                                   ).grid(row=0, column=1, sticky="nsew", padx=2)
+
+        def _on_short_range_changed(self):
+            lo = max(1, int(self.short_lo.get()))
+            hi = max(1, int(self.short_hi.get()))
+            if lo > hi:                     # 保证下限 <= 上限
+                lo, hi = hi, lo
+                self.short_lo.set(lo)
+                self.short_hi.set(hi)
+            self.cfg["short_range"] = [lo, hi]
+            self._save_cfg()
+            self._paint_mode(False)
+
+        def _on_fixed_size_changed(self, dim):
+            """改宽或高：按当前比例联动另一维，保证输出仍是设定比例。"""
+            w = max(1, int(self.fixed_w.get()))
+            h = max(1, int(self.fixed_h.get()))
+            rw, rh = int(self.ratio_w.get()), int(self.ratio_h.get())
+            ratio = rw / max(1, rh)
+            if dim == 0:
+                h = max(1, round(w / ratio))
+            else:
+                w = max(1, round(h * ratio))
+            self.fixed_w.set(w)
+            self.fixed_h.set(h)
+            self.cfg["fixed_size"] = [w, h]
+            self._save_cfg()
+            self._paint_mode(False)
+            self._refresh_after_param_change()
+
+        def _on_ratio_changed(self):
+            """纵横比数值被改：定尺模式下同步输出尺寸，保持同比例。"""
+            try:
+                rw = max(1, int(self.ratio_w.get()))
+                rh = max(1, int(self.ratio_h.get()))
+            except Exception:
+                return
+            self.cfg["ratio"] = [rw, rh]
+            if self.cfg.get("mode") == MODE_FIXED:
+                w = max(1, int(self.fixed_w.get()))
+                h = max(1, round(w / (rw / rh)))
+                self.fixed_h.set(h)
+                self.cfg["fixed_size"] = [w, h]
+            self._save_cfg()
+            self._paint_ratio()
+            self._refresh_after_param_change()
+
+        def _refresh_after_param_change(self):
+            """参数变化后刷新画布：重放取景框并重绘。"""
+            if self.img is None:
+                return
+            self._place_box_default()
+            self._draw()
+            self._render_preview()
 
         def _make_stepper(self, parent, var, step, width, on_step=None):
             """Spinbox 步进器：上下箭头由主题引擎自绘（等大对称），可连点；可直接手填。"""
@@ -2185,122 +2472,30 @@ def main():
                 # 防抖：command（连点/长按上下箭头）与 KeyRelease（手输）都会高频触发，
                 # 未防抖时每触发一次就全量重绘 + 写一次 config.json，长按箭头会把 UI 拖死，
                 # 还会把中间值（如 w=2）逐次持久化。合并到 120ms 后执行一次。
-                _t = {"id": None}
+                # 定时器登记到 self._step_timers，供 _rebuild_params 销毁前统一取消。
+                key = str(id(sb))
+                self._step_timers[key] = None
 
                 def _fire():
-                    _t["id"] = None
+                    self._step_timers[key] = None
                     on_step()
 
                 def _schedule():
-                    if _t["id"]:
-                        self.root.after_cancel(_t["id"])
-                    _t["id"] = self.root.after(120, _fire)
+                    if self._step_timers.get(key):
+                        try:
+                            self.root.after_cancel(self._step_timers[key])
+                        except Exception:
+                            pass
+                    self._step_timers[key] = self.root.after(120, _fire)
 
                 sb.configure(command=_schedule)
                 sb.bind("<KeyRelease>", lambda ev: _schedule())
                 sb.bind("<FocusOut>", lambda ev: _schedule())
             return sb
 
-        def _on_ratio_changed(self):
-            """纵横比 宽:高 改变 → 以宽为准，两档 h = round(w/ratio) 保持同比例。"""
-            try:
-                rw = max(1, int(self.ratio_w.get()))
-                rh = max(1, int(self.ratio_h.get()))
-            except Exception:
-                return
-            ratio = rw / rh
-            for k in ("large", "small"):
-                w = int(self.tier_vars[k]["w"].get())
-                h = max(1, round(w / ratio))
-                self.tier_vars[k]["h"].set(h)
-                self.cfg["tiers"][k]["w"] = w
-                self.cfg["tiers"][k]["h"] = h
-            self.cfg["ratio"] = [rw, rh]
-            self._save_cfg()
-            if self.img is None:
-                return
-            self._place_box_default()
-            self._draw()
-            self._render_preview()
-
-        def _on_tier_changed(self, key, dim):
-            """某档宽或高被改：写回配置；锁定时改宽联动 h；当前档实时刷新裁剪框。"""
-            try:
-                v = max(1, int(self.tier_vars[key][dim].get()))
-            except Exception:
-                return
-            self.cfg["tiers"][key][dim] = v
-            if self.ratio_lock and dim == "w":
-                ratio = int(self.ratio_w.get()) / max(1, int(self.ratio_h.get()))
-                h = max(1, round(v / ratio))
-                self.tier_vars[key]["h"].set(h)
-                self.cfg["tiers"][key]["h"] = h
-            self._save_cfg()
-            if key == self.active_tier and self.img is not None:
-                self._place_box_default()
-                self._draw()
-                self._render_preview()
-
-        def _set_tier_active(self, key):
-            """单选生效档：点大档/小档之一即生效，裁剪框立即用该档尺寸。"""
-            if key not in self.cfg["tiers"]:
-                return
-            self.active_tier = key
-            self._save_cfg()
-            self._refresh_headers()
-            if self.img is not None:
-                self._place_box_default()
-                self._draw()
-                self._render_preview()
-
-        def toggle_ratio_lock(self):
-            """纵横比开关：开→按 ratio 对齐两档 h；关→保持当前数值不动。"""
-            self.ratio_lock = not self.ratio_lock
-            self._save_cfg()
-            self._refresh_headers()
-            if self.ratio_lock:
-                self._on_ratio_changed()
-            else:
-                if self.img is not None:
-                    self._place_box_default()
-                    self._draw()
-                    self._render_preview()
-
-        def _style_header(self, btn, on):
-            # 激活态用 secondary 实心填充，未激活用 secondary-outline（透明底描边）。色取自 THEME。
-            try:
-                if on:
-                    btn.configure(fg_color=THEME["SECONDARY"], hover_color=THEME["SECONDARY_H"], text_color="#ffffff")
-                else:
-                    btn.configure(fg_color="transparent", hover_color=THEME["HOVER_LIGHT"], text_color=THEME["SECONDARY"])
-            except Exception:
-                pass
-
-        def _refresh_headers(self):
-            """刷新三个行首按钮视觉态；锁定时禁用 h 输入框与纵横比输入框。"""
-            self._style_header(self.ratio_btn, self.ratio_lock)
-            for e in self.ratio_entries:
-                try:
-                    e.configure(state="disabled" if not self.ratio_lock else "normal")
-                except Exception:
-                    pass
-            for key, btn in self.tier_btns.items():
-                self._style_header(btn, self.active_tier == key)
-                try:
-                    self.tier_h_entries[key].configure(state="disabled" if self.ratio_lock else "normal")
-                except Exception:
-                    pass
-
         def _save_cfg(self):
-            self.cfg["active_tier"] = self.active_tier
-            self.cfg["ratio_lock"] = self.ratio_lock
+            self.cfg["mode"] = self.cfg.get("mode", MODE_CLAMP)
             self.cfg["ratio"] = [int(self.ratio_w.get()), int(self.ratio_h.get())]
-            for k in ("large", "small"):
-                try:
-                    self.cfg["tiers"][k]["w"] = int(self.tier_vars[k]["w"].get())
-                    self.cfg["tiers"][k]["h"] = int(self.tier_vars[k]["h"].get())
-                except Exception:
-                    pass
             save_config(self.config_path, self.cfg)
 
         def _open(self, path):
