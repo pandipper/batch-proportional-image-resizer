@@ -1,11 +1,16 @@
 <p align="center"><img src="logo.png" alt="logo" width="96"></p>
 
-# 批量图片等比例缩放工具 · Batch Proportional Image Resizer
+<h1 align="center">
+  批量图片等比例缩放工具<br>
+  Batch Proportional Image Resizer
+</h1>
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
-![Python](https://img.shields.io/badge/python-3.12%2B-green)
-![License](https://img.shields.io/badge/license-MIT-green)
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/platform-Windows-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/python-3.12%2B-green" alt="Python">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+</p>
 
 <p align="center"><img src="screenshots/landscape.png" alt="主界面（横版 16:9）"></p>
 
