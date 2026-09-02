@@ -1,9 +1,13 @@
+<p align="center"><img src="logo.png" alt="logo" width="96"></p>
+
 # 批量图片等比例缩放工具 · Batch Proportional Image Resizer
 
 ![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.12%2B-green)
 ![License](https://img.shields.io/badge/license-MIT-green)
+
+<p align="center"><img src="screenshots/landscape.png" alt="主界面（横版 16:9）"></p>
 
 两步式批量图片处理工具，中文界面，**纯等比、不裁不拉伸**地统一素材尺寸，再逐张用取景框（默认 16:9）导出成图。适合电商 / 短视频素材的批量规整。
 
@@ -99,6 +103,9 @@ step2 的取景框只是**比例参考**（默认 16:9），**不是目标分辨
 
 > 夹逼模式**没有大档 / 小档的概念**：长边由「短边 × 纵横比」唯一决定，再设一个长边是冗余的，只会互相打架。定尺模式也只关心输出尺寸这一个目标。
 
+<p align="center"><img src="screenshots/portrait.png" alt="切到竖版 9:16" width="560"></p>
+<p align="center"><i>点「纵」/ 冒号 切到竖版 9:16，定尺宽高同步交换</i></p>
+
 ---
 
 ## 四、快捷键与变换
@@ -124,6 +131,8 @@ step2 的取景框只是**比例参考**（默认 16:9），**不是目标分辨
 - 「移除」按钮把文件移到 `规范素材图/已移除/`，**不真正删除**。
 - step2 取景框比例跟随「纵横比」；横图优先保高、竖图优先保宽，最大化保留画面（夹逼模式下框自动内接于图内最大同比例区域）。
 - 支持 `jpg / png / webp / bmp / tif`。主题共 4 个亮色主题（minty / everforest-light / tokyo-night-light / solarized-light），在设置里循环切换并持久化。
+
+<p align="center"><img src="screenshots/theme-switch.gif" alt="主题切换动图"></p>
 
 ---
 

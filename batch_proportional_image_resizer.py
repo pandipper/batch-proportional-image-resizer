@@ -137,7 +137,7 @@ THEME = {
 
 # 仅保留亮色主题（暗色主题已废弃）。可选 4 个主题：1 个默认 + 3 个 ttkbootstrap 内置官方主题。
 APP_TITLE = "批量图片等比例缩放工具"
-APP_VERSION = "1.0.2"          # 显示在窗口标题，用于发布后可追溯版本
+APP_VERSION = "1.1.0"          # 显示在窗口标题，用于发布后可追溯版本
 THEME_CHOICES = ["minty", "everforest-light", "tokyo-night-light", "solarized-light"]
 
 # 全站字体：注册成功后 Tk 按此名取用；注册失败则回退系统字体（见 _register_fonts）
@@ -1406,14 +1406,46 @@ def main():
             return ans == "是"
 
         def _msg_yesno_rich(self, title: str, lines) -> bool:
-            """富文本确认框：每行可独立 bootstyle 颜色。返回 True = 用户点「是"。"""
-            from ttkbootstrap.dialogs.message import _alert_icon
+            """富文本确认框：每行可独立 bootstyle 颜色。返回 True = 用户点「是\"。"""
             dialog = _RichMessageDialog(
                 lines=lines, title=title, parent=self.root,
                 buttons=["否:secondary", "是:primary"],
-                icon=_alert_icon("question"), alert=False, localize=False)
+                icon=None, alert=False, localize=False)   # 不要大问号图标，文案已自含提示
+            # 弹窗（Toplevel）不继承主窗口的窗口图标，单独设一次 Hokko.ico / logo.png
+            try:
+                for _p in self._icon_candidates():
+                    if not os.path.isfile(_p):
+                        continue
+                    if os.path.splitext(_p)[1].lower() == ".ico":
+                        dialog.iconbitmap(_p)
+                    else:
+                        from PIL import Image, ImageTk
+                        _ic = Image.open(_p).convert("RGBA").resize((64, 64), Image.LANCZOS)
+                        dialog.iconphoto(True, ImageTk.PhotoImage(_ic))
+                    break
+            except Exception:
+                pass
             dialog.show()
             return dialog.result == "是"
+
+        def _icon_candidates(self):
+            """与 main() 同款的窗口图标查找顺序：Hokko.ico > logo.png。
+            冻结态优先 _MEIPASS，回退 exe / 源文件同目录。"""
+            cands = []
+            if getattr(sys, "frozen", False):
+                if hasattr(sys, "_MEIPASS"):
+                    cands += [os.path.join(sys._MEIPASS, "Hokko.ico"),
+                              os.path.join(sys._MEIPASS, "logo.png")]
+                cands += [os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                       "Hokko.ico"),
+                          os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                       "logo.png")]
+            try:
+                _here = os.path.dirname(os.path.abspath(__file__))
+            except NameError:
+                _here = os.getcwd()
+            cands += [os.path.join(_here, "Hokko.ico"), os.path.join(_here, "logo.png")]
+            return cands
 
         # ---------------- 导入 ----------------
         def import_folder(self):
